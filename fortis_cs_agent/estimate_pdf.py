@@ -1,145 +1,277 @@
 """
-Professional PDF generation for packaging estimates (fpdf2).
+Premium estimate PDF - Fortis Edge branding (#00A651), tables, validity, terms (fpdf2 / Latin-1 safe).
 """
 
 from __future__ import annotations
 
 import base64
+import os
 from decimal import Decimal
 from io import BytesIO
 from typing import BinaryIO
 
 from fpdf import FPDF
 
-from fortis_cs_agent.estimate_models import CreateEstimateResult, EstimateRequest
+from fortis_cs_agent.estimate_models import CreateEstimateResult, EstimateRequest, ProductType
+
+# Fortis Edge brand green
+ACCENT = (0, 166, 81)
+CHARCOAL = (38, 40, 44)
+MUTED = (95, 99, 104)
+
+_TYPE_LABEL = {
+    ProductType.PRESSURE_SENSITIVE_LABELS: "PS labels",
+    ProductType.RFID_LABELS_OR_INLAYS: "RFID / inlays",
+    ProductType.SHRINK_SLEEVES: "Shrink sleeves",
+    ProductType.FLEXIBLE_PACKAGING: "Flexible packaging",
+    ProductType.FOLDING_CARTON: "Folding cartons",
+    ProductType.RSC: "Corrugated RSC",
+    ProductType.TELESCOPING: "Telescoping",
+    ProductType.MAILER: "Mailers",
+    ProductType.PARTITION: "Partitions",
+    ProductType.TRAY_SLEEVE_COMBO: "Tray / sleeve",
+    ProductType.BULK_OTHER: "Bulk / other",
+}
 
 
 class _FortisPDF(FPDF):
     def header(self) -> None:
+        self.set_fill_color(*ACCENT)
+        self.rect(0, 0, 220, 22, style="F")
+        self.set_xy(12, 6)
         self.set_font("Helvetica", "B", 16)
-        self.set_text_color(25, 45, 85)
-        self.cell(0, 10, "Fortis Edge", ln=True)
-        self.set_font("Helvetica", "", 10)
-        self.set_text_color(80, 80, 80)
-        self.cell(0, 6, "Packaging estimate", ln=True)
-        self.ln(4)
-        self.set_draw_color(200, 200, 200)
-        self.line(10, self.get_y(), 200, self.get_y())
+        self.set_text_color(255, 255, 255)
+        self.cell(0, 7, "FORTIS EDGE", ln=True)
+        self.set_x(12)
+        self.set_font("Helvetica", "", 9)
+        self.cell(0, 5, "Internal estimate | Packaging & labeling solutions", ln=True)
         self.ln(6)
+        self.set_text_color(*CHARCOAL)
 
     def footer(self) -> None:
-        self.set_y(-15)
-        self.set_font("Helvetica", "I", 8)
-        self.set_text_color(120, 120, 120)
-        self.cell(0, 10, f"Page {self.page_no()}/{{nb}}", align="C")
+        self.set_y(-12)
+        self.set_font("Helvetica", "I", 7)
+        self.set_text_color(*MUTED)
+        self.cell(0, 4, f"Confidential | Page {self.page_no()}/{{nb}}", align="C")
 
 
 def _money(d: Decimal) -> str:
     return f"${d.quantize(Decimal('0.01')):,.2f}"
 
 
+def _lbl(pt: ProductType) -> str:
+    return _TYPE_LABEL.get(pt, pt.value.replace("_", " ")[:24])
+
+
+def _ascii(s: str | None, maxlen: int = 500) -> str:
+    if not s:
+        return ""
+    t = s.replace("\u2014", "-").replace("\u2013", "-").replace("\u2019", "'").replace("\u201c", '"').replace(
+        "\u201d", '"'
+    )
+    return t[:maxlen]
+
+
 def build_estimate_pdf_bytes(result: CreateEstimateResult) -> bytes:
-    """Render estimate + pricing into a PDF document."""
-    est: EstimateRequest = result.estimate
+    est = result.estimate
     pr = result.pricing
+    support_email = os.getenv("FORTIS_SUPPORT_EMAIL", "edge-support@fortisedge.internal")
+    support_phone = os.getenv("FORTIS_SUPPORT_PHONE", "(801) 459-0886")
 
     pdf = _FortisPDF()
     pdf.alias_nb_pages()
-    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.set_auto_page_break(auto=True, margin=16)
+    pdf.set_margins(12, 12, 12)
     pdf.add_page()
-    pdf.set_font("Helvetica", "", 10)
-    pdf.set_text_color(30, 30, 30)
 
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(0, 8, "Estimate summary", ln=True)
-    pdf.set_font("Helvetica", "", 10)
-    pdf.multi_cell(0, 6, result.message)
-    pdf.ln(2)
-
-    pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(0, 7, "Customer", ln=True)
-    pdf.set_font("Helvetica", "", 10)
-    cust = est.customer
-    lines = [
-        cust.contact_name,
-        *( [cust.company] if cust.company else [] ),
-        *( [cust.email] if cust.email else [] ),
-        *( [cust.phone] if cust.phone else [] ),
-    ]
-    for line in lines:
-        pdf.cell(0, 6, line, ln=True)
-    pdf.ln(2)
-
-    pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(40, 7, "Estimate #", border=0)
-    pdf.cell(60, 7, "Date", border=0)
-    pdf.cell(0, 7, "Turnaround", ln=True)
-    pdf.set_font("Helvetica", "", 10)
-    pdf.cell(40, 7, str(est.estimate_id))
-    pdf.cell(60, 7, est.estimate_date.isoformat())
-    pdf.cell(0, 7, est.turnaround, ln=True)
-    if est.ship_to_region:
-        pdf.cell(0, 6, f"Ship region (indicative): {est.ship_to_region}", ln=True)
-    pdf.ln(3)
-
-    pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(0, 7, "Line items", ln=True)
-    pdf.set_font("Helvetica", "B", 9)
-    pdf.set_fill_color(240, 242, 247)
-    pdf.cell(52, 7, "Item", border=1, fill=True)
-    pdf.cell(28, 7, "Type", border=1, fill=True)
-    pdf.cell(18, 7, "Qty", border=1, fill=True)
-    pdf.cell(44, 7, "Dims (LxWxD in)", border=1, fill=True)
-    pdf.cell(28, 7, "Board / print", border=1, fill=True, ln=True)
-
-    pdf.set_font("Helvetica", "", 8)
-    for li in est.line_items:
-        dims = "—"
-        if li.length_in and li.width_in and li.depth_in:
-            dims = f"{li.length_in}x{li.width_in}x{li.depth_in}"
-        spec = (li.board or "") + ("; " if li.board and li.print_specs else "") + (li.print_specs or "")
-        if not spec.strip():
-            spec = "—"
-        pdf.cell(52, 7, li.name[:30], border=1)
-        pdf.cell(28, 7, li.product_type.value[:16], border=1)
-        pdf.cell(18, 7, str(li.quantity), border=1)
-        pdf.cell(44, 7, dims[:22], border=1)
-        pdf.cell(28, 7, spec[:18], border=1, ln=True)
-        if li.notes:
-            pdf.set_font("Helvetica", "I", 8)
-            pdf.cell(0, 5, f"  Note: {li.notes}", ln=True)
-            pdf.set_font("Helvetica", "", 8)
-    pdf.ln(4)
-
-    pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(0, 7, "Pricing (indicative)", ln=True)
-    pdf.set_font("Helvetica", "", 10)
-    pdf.cell(0, 6, f"Subtotal: {_money(pr.subtotal)}", ln=True)
-    pdf.cell(0, 6, f"Setup / tooling: {_money(pr.setup_fees)}", ln=True)
-    pdf.cell(0, 6, f"Freight (planning): {_money(pr.freight_estimate)}", ln=True)
-    pdf.cell(0, 6, f"Turnaround factor: x{pr.rush_multiplier}", ln=True)
-    pdf.set_font("Helvetica", "B", 11)
-    pdf.cell(0, 8, f"Total: {_money(pr.total)} {pr.currency}", ln=True)
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.set_text_color(*CHARCOAL)
+    pdf.cell(0, 7, "INDICATIVE ESTIMATE", ln=True)
     pdf.set_font("Helvetica", "", 9)
-    if pr.assumptions:
-        pdf.multi_cell(0, 5, "Assumptions:\n- " + "\n- ".join(pr.assumptions))
-    pdf.ln(2)
-
-    if est.internal_notes:
-        pdf.set_font("Helvetica", "B", 10)
-        pdf.cell(0, 6, "Internal notes", ln=True)
-        pdf.set_font("Helvetica", "", 9)
-        pdf.multi_cell(0, 5, est.internal_notes)
-
-    pdf.set_font("Helvetica", "I", 9)
-    pdf.set_text_color(90, 90, 90)
-    pdf.ln(4)
+    pdf.set_text_color(*MUTED)
     pdf.multi_cell(
         0,
-        5,
-        "This estimate is for planning purposes. Final pricing, structure review, and lead times "
-        "are confirmed by Fortis operations. Track orders and share artwork in the Fortis Edge Portal.",
+        4.2,
+        _ascii(
+            "Planning document for internal Fortis CS, commercial, and plant partners. "
+            "Not a binding offer until authorized leadership releases a formal quote."
+        ),
     )
+    pdf.ln(3)
+
+    # Meta strip
+    pdf.set_fill_color(245, 248, 246)
+    pdf.set_draw_color(220, 225, 222)
+    pdf.set_font("Helvetica", "B", 8)
+    pdf.set_text_color(*ACCENT)
+    pdf.cell(48, 6, "Estimate #", border=1, fill=True, ln=0)
+    pdf.set_text_color(*CHARCOAL)
+    pdf.cell(62, 6, _ascii(str(est.estimate_id), 40), border=1, fill=True, ln=0)
+    pdf.set_font("Helvetica", "B", 8)
+    pdf.set_text_color(*ACCENT)
+    pdf.cell(40, 6, "Issue date", border=1, fill=True, ln=0)
+    pdf.set_font("Helvetica", "", 8)
+    pdf.set_text_color(*CHARCOAL)
+    pdf.cell(0, 6, est.estimate_date.strftime("%d %b %Y"), border=1, fill=True, ln=True)
+
+    pdf.set_font("Helvetica", "B", 8)
+    pdf.set_text_color(*ACCENT)
+    pdf.cell(48, 6, "Valid through", border=1, fill=True, ln=0)
+    pdf.set_font("Helvetica", "", 8)
+    pdf.set_text_color(*CHARCOAL)
+    pdf.cell(62, 6, est.valid_until.strftime("%d %b %Y"), border=1, fill=True, ln=0)
+    pdf.set_font("Helvetica", "B", 8)
+    pdf.set_text_color(*ACCENT)
+    pdf.cell(40, 6, "Urgency band", border=1, fill=True, ln=0)
+    pdf.set_font("Helvetica", "", 8)
+    pdf.set_text_color(*CHARCOAL)
+    pdf.cell(0, 6, est.turnaround.title(), border=1, fill=True, ln=True)
+    pdf.ln(4)
+
+    # Bill to
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.set_text_color(*ACCENT)
+    pdf.cell(0, 6, "Bill to / attention", ln=True)
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(*CHARCOAL)
+    c = est.customer
+    for line in [_ascii(c.contact_name), _ascii(c.company), _ascii(c.email), _ascii(c.phone)]:
+        if line:
+            pdf.cell(0, 4.5, line, ln=True)
+    if est.ship_to_region:
+        pdf.set_font("Helvetica", "I", 8)
+        pdf.cell(0, 4.5, _ascii(f"Ship / freight bias: {est.ship_to_region}"), ln=True)
+    pdf.ln(2)
+
+    if est.customer_notes:
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_text_color(*ACCENT)
+        pdf.cell(0, 5, "Scope notes", ln=True)
+        pdf.set_font("Helvetica", "", 8)
+        pdf.set_text_color(*CHARCOAL)
+        pdf.multi_cell(0, 4, _ascii(est.customer_notes, 2000))
+        pdf.ln(2)
+
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.set_text_color(*ACCENT)
+    pdf.cell(0, 5, "Summary", ln=True)
+    pdf.set_font("Helvetica", "", 8)
+    pdf.set_text_color(*CHARCOAL)
+    pdf.multi_cell(0, 4, _ascii(result.message, 1200))
+    pdf.ln(3)
+
+    # Line grid
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.set_text_color(*ACCENT)
+    pdf.cell(0, 6, "Line items", ln=True)
+    cols = {
+        "sku": 36,
+        "cat": 32,
+        "qty": 14,
+        "wh": 22,
+        "mat": 30,
+        "fin": 28,
+        "col": 26,
+    }
+    pdf.set_font("Helvetica", "B", 7)
+    pdf.set_fill_color(236, 246, 239)
+    pdf.set_text_color(*CHARCOAL)
+    pdf.cell(cols["sku"], 5.5, "SKU / desc", border=1, fill=True, ln=0)
+    pdf.cell(cols["cat"], 5.5, "Category", border=1, fill=True, ln=0)
+    pdf.cell(cols["qty"], 5.5, "Qty", border=1, fill=True, ln=0)
+    pdf.cell(cols["wh"], 5.5, "W x H in", border=1, fill=True, ln=0)
+    pdf.cell(cols["mat"], 5.5, "Material", border=1, fill=True, ln=0)
+    pdf.cell(cols["fin"], 5.5, "Finish", border=1, fill=True, ln=0)
+    pdf.cell(cols["col"], 5.5, "Colors", border=1, fill=True, ln=True)
+
+    pdf.set_font("Helvetica", "", 7)
+    for li in est.line_items:
+        w = li.width_in or "--"
+        h = li.length_in or "--"
+        wh = f"{w} x {h}" if w != "--" or h != "--" else "--"
+        pdf.cell(cols["sku"], 5, _ascii(li.name, 22), border=1, ln=0)
+        pdf.cell(cols["cat"], 5, _ascii(_lbl(li.product_type), 18), border=1, ln=0)
+        pdf.cell(cols["qty"], 5, f"{li.quantity:,}", border=1, ln=0)
+        pdf.cell(cols["wh"], 5, _ascii(str(wh), 14), border=1, ln=0)
+        pdf.cell(cols["mat"], 5, _ascii(li.board, 26), border=1, ln=0)
+        pdf.cell(cols["fin"], 5, _ascii(li.finish, 24), border=1, ln=0)
+        pdf.cell(cols["col"], 5, _ascii(li.colors, 22), border=1, ln=True)
+        if li.notes:
+            pdf.set_font("Helvetica", "I", 6)
+            pdf.multi_cell(0, 3.5, _ascii(f"  Line note: {li.notes}", 400), border="LR")
+            pdf.set_font("Helvetica", "", 7)
+
+    pdf.ln(4)
+    pdf.set_x(12)
+
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.set_text_color(*ACCENT)
+    pdf.cell(0, 6, "Investment summary (USD)", ln=True)
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(*CHARCOAL)
+    pdf.cell(76, 5, "Subtotal (extended)", ln=0)
+    pdf.cell(0, 5, _money(pr.subtotal), ln=True)
+    pdf.cell(76, 5, "Setup / tooling / program", ln=0)
+    pdf.cell(0, 5, _money(pr.setup_fees), ln=True)
+    pdf.cell(76, 5, "Freight planning", ln=0)
+    pdf.cell(0, 5, _money(pr.freight_estimate), ln=True)
+    pdf.cell(76, 5, "Schedule multiplier", ln=0)
+    pdf.cell(0, 5, f"x {pr.rush_multiplier}", ln=True)
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.set_text_color(*ACCENT)
+    pdf.cell(76, 6, "Indicative total", ln=0)
+    pdf.set_text_color(*CHARCOAL)
+    pdf.cell(0, 6, f"{_money(pr.total)} {pr.currency}", ln=True)
+    pdf.ln(2)
+
+    pdf.set_font("Helvetica", "B", 8)
+    pdf.set_text_color(*ACCENT)
+    pdf.cell(0, 5, "Key assumptions", ln=True)
+    pdf.set_font("Helvetica", "", 7)
+    pdf.set_text_color(*MUTED)
+    for a in pr.assumptions:
+        pdf.set_x(12)
+        pdf.multi_cell(0, 3.6, _ascii(f"- {a}", 500))
+
+    if est.internal_notes:
+        pdf.ln(2)
+        pdf.set_font("Helvetica", "BI", 8)
+        pdf.set_text_color(*CHARCOAL)
+        pdf.cell(0, 5, "Internal notes (Fortis only)", ln=True)
+        pdf.set_font("Helvetica", "", 7)
+        pdf.multi_cell(0, 3.6, _ascii(est.internal_notes, 2500))
+
+    pdf.ln(5)
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.set_text_color(*ACCENT)
+    pdf.cell(0, 5, "Terms and conditions", ln=True)
+    pdf.set_font("Helvetica", "", 7)
+    pdf.set_text_color(*MUTED)
+    tc = (
+        "1. Validity: Pricing is indicative until the valid-through date above unless extended in writing by "
+        "Fortis commercial leadership. "
+        "2. Scope: Excludes tariffs, rush overtime not captured, customer-induced holds, rework from non-Portal "
+        "artwork issues, and consequential damages. "
+        "3. Portal: Fortis Edge remains the system of record for approvals, superseding informal email sign-offs. "
+        "4. SBU cadence: Portal-first routing is designed to compress CS cycle time versus unmanaged email threads - "
+        "final ship dates still require plant load confirmation. "
+        "5. Governing terms: Master supply agreement, NDA, and Fortis sustainability policies apply where executed."
+    )
+    pdf.multi_cell(0, 3.7, _ascii(tc, 4000))
+
+    pdf.ln(5)
+    pdf.set_fill_color(*ACCENT)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Helvetica", "B", 8)
+    pdf.cell(0, 6, " Fortis Edge | Questions & next steps", ln=True)
+    pdf.set_text_color(*CHARCOAL)
+    pdf.set_font("Helvetica", "", 8)
+    body = (
+        f"Portal & workflow: Fortis Edge (self-service submissions and approvals). "
+        f"CS hotline: {support_phone}. Estimating mailbox: {support_email}. "
+        f"Reference this estimate ID on POs and Portal tickets."
+    )
+    pdf.multi_cell(0, 4, _ascii(body, 800))
 
     out = BytesIO()
     pdf.output(out)
@@ -151,7 +283,6 @@ def pdf_to_base64(data: bytes) -> str:
 
 
 def write_estimate_pdf_binary(result: CreateEstimateResult) -> BinaryIO:
-    """Wrap bytes in BytesIO for Response streaming."""
     buf = BytesIO(build_estimate_pdf_bytes(result))
     buf.seek(0)
     return buf

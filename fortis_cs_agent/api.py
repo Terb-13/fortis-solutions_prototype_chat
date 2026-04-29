@@ -15,7 +15,7 @@ from typing import Any, Literal
 import httpx
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from twilio.request_validator import RequestValidator
 from twilio.twiml.messaging_response import MessagingResponse
 
@@ -23,7 +23,8 @@ from fortis_cs_agent.estimate_models import EstimateRequest
 from fortis_cs_agent.estimate_pdf import write_estimate_pdf_binary
 from fortis_cs_agent.knowledge import format_knowledge_context, retrieve_knowledge_snippets
 from fortis_cs_agent.prompts import SYSTEM_PROMPT
-from fortis_cs_agent.tools import CREATE_ESTIMATE_TOOL, create_estimate
+from fortis_cs_agent.store import load_estimate_snapshot
+from fortis_cs_agent.tools import AGENT_TOOLS, assemble_estimate_result, create_estimate, execute_agent_tool
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,14 @@ TWILIO_VALIDATE = os.getenv("TWILIO_VALIDATE_SIGNATURE", "false").lower() in ("1
 
 CONV_TABLE = os.getenv("FORTIS_CONVERSATIONS_TABLE", "fortis_conversations")
 MSG_TABLE = os.getenv("FORTIS_MESSAGES_TABLE", "fortis_messages")
+
+
+def estimate_pdf_absolute_url(request: Request, estimate_id: str) -> str:
+    """Build an absolute `/estimate-pdf/{id}` URL for emailed links and JSON consumers."""
+    pub = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+    if pub:
+        return f"{pub}/estimate-pdf/{estimate_id}"
+    return str(request.url_for("estimate_pdf_download", estimate_id=estimate_id))
 
 
 # --- Supabase persistence (graceful degrade when unset) --------------------------------
@@ -175,8 +184,15 @@ async def _grok_chat(
     async with httpx.AsyncClient(timeout=120.0) as client:
         r = await client.post(url, headers=headers, json=body)
         if r.status_code >= 400:
-            logger.error("Grok error %s: %s", r.status_code, r.text[:2000])
-            raise HTTPException(status_code=502, detail="Grok upstream error.")
+            logger.error(
+                "Grok API HTTP %s body_prefix=%s",
+                r.status_code,
+                (r.text or "")[:1200].replace("\n", " "),
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="Grok API error. Check XAI_API_KEY, XAI_CHAT_MODEL, and upstream status before retrying.",
+            )
         return r.json()
 
 
@@ -214,12 +230,19 @@ async def run_agent_turn(
         augmented = knowledge_block + "\n\nCustomer message:\n" + user_text
     msgs.append({"role": "user", "content": augmented})
 
-    tools_list = [CREATE_ESTIMATE_TOOL]
+    tools_list = AGENT_TOOLS
 
     grok_msgs = [*msgs]
 
     while True:
-        data = await _grok_chat(grok_msgs, tools=tools_list)
+        try:
+            data = await _grok_chat(grok_msgs, tools=tools_list)
+        except HTTPException:
+            raise
+        except Exception:
+            logger.exception("Grok invocation failed in run_agent_turn (conversation_id=%s).", conversation_id)
+            raise HTTPException(status_code=502, detail="Upstream model unavailable.") from None
+
         choice = data["choices"][0]["message"]
         tc = choice.get("tool_calls") or []
         assistant_msg: dict[str, Any] = {"role": "assistant"}
@@ -234,26 +257,17 @@ async def run_agent_turn(
                 try:
                     args = json.loads(args_raw)
                 except json.JSONDecodeError:
+                    logger.warning("tool_call_invalid_json tool=%s raw=%s", fname, args_raw[:200])
                     args = {}
 
-                if fname == "create_estimate":
-                    result = create_estimate(payload=args, include_pdf_base64=False)
-                    tool_reply = json.dumps(result.to_tool_dict())
-                    grok_msgs.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call.get("id", "call_estimate"),
-                            "content": tool_reply,
-                        }
-                    )
-                else:
-                    grok_msgs.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call.get("id", "call_unknown"),
-                            "content": json.dumps({"error": "unsupported_tool"}),
-                        }
-                    )
+                payload = execute_agent_tool(fname or "", args, persist_estimate=True)
+                grok_msgs.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.get("id", "call"),
+                        "content": json.dumps(payload),
+                    }
+                )
             continue
 
         content = choice.get("content") or ""
@@ -273,12 +287,7 @@ class ChatResponse(BaseModel):
     conversation_id: str
 
 
-class TestChatRequest(BaseModel):
-    message: str = Field(..., min_length=1)
-
-
 # --- Routes ---------------------------------------------------------------------------
-
 
 @router.get("/health")
 async def health() -> dict[str, Any]:
@@ -288,6 +297,25 @@ async def health() -> dict[str, Any]:
         "grok_configured": bool(XAI_API_KEY),
         "supabase_configured": bool(SUPABASE_KEY),
     }
+
+
+@router.get("/estimate-pdf/{estimate_id}", name="estimate_pdf_download")
+async def estimate_pdf_download(estimate_id: str) -> StreamingResponse:
+    """Regenerate the PDF for a previously stored estimate (Supabase or in-process cache)."""
+    snap = load_estimate_snapshot(estimate_id)
+    if snap is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Estimate not found. Create one via POST /create-estimate or the chat tool first.",
+        )
+    result = assemble_estimate_result(snap, include_pdf_base64=False)
+    bio = write_estimate_pdf_binary(result)
+    filename = f"fortis_estimate_{estimate_id}.pdf"
+    return StreamingResponse(
+        bio,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -305,7 +333,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
     except HTTPException:
         raise
     except Exception:
-        logger.exception("chat pipeline failed")
+        logger.exception("chat pipeline failed (conversation_id=%s)", cid)
         raise HTTPException(status_code=500, detail="Chat failed.") from None
 
     append_message(cid, role="user", content=req.message)
@@ -313,21 +341,35 @@ async def chat(req: ChatRequest) -> ChatResponse:
     return ChatResponse(reply=reply, conversation_id=cid)
 
 
-@router.post("/test-chat", response_model=ChatResponse)
-async def test_chat(req: TestChatRequest) -> ChatResponse:
-    """
-    Ephemeral chat (no Supabase writes). Same model + tools as /chat.
-    """
+@router.get("/test-chat", response_model=ChatResponse)
+async def test_chat(
+    message: str = Query(
+        ...,
+        min_length=1,
+        description="Ephemeral Grok probe (same tools as POST /chat, no persistence).",
+    ),
+) -> ChatResponse:
+    """GET convenience for probes and scripted checks — no Supabase writes."""
     if not XAI_API_KEY:
         raise HTTPException(status_code=503, detail="XAI_API_KEY is not configured.")
 
     cid = str(uuid.uuid4())
     msgs: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
-    msgs.append({"role": "user", "content": req.message})
+    msgs.append({"role": "user", "content": message})
     grok_msgs = [*msgs]
 
     while True:
-        data = await _grok_chat(grok_msgs, tools=[CREATE_ESTIMATE_TOOL])
+        try:
+            data = await _grok_chat(grok_msgs, tools=AGENT_TOOLS)
+        except HTTPException:
+            raise
+        except Exception:
+            logger.exception("test-chat Grok invocation failed (session=%s).", cid)
+            raise HTTPException(
+                status_code=502,
+                detail="Model request failed. Verify Grok configuration, then retry.",
+            ) from None
+
         choice = data["choices"][0]["message"]
         assistant_msg = {"role": "assistant", **choice}
         grok_msgs.append(assistant_msg)
@@ -340,16 +382,16 @@ async def test_chat(req: TestChatRequest) -> ChatResponse:
                 try:
                     args = json.loads(args_raw)
                 except json.JSONDecodeError:
+                    logger.warning("test_chat bad_tool_json tool=%s", fname)
                     args = {}
-                if fname == "create_estimate":
-                    result = create_estimate(payload=args, include_pdf_base64=False)
-                    grok_msgs.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call.get("id", "call_estimate"),
-                            "content": json.dumps(result.to_tool_dict()),
-                        }
-                    )
+                payload = execute_agent_tool(fname or "", args, persist_estimate=False)
+                grok_msgs.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.get("id", "call"),
+                        "content": json.dumps(payload),
+                    }
+                )
             continue
 
         content = choice.get("content") or ""
@@ -414,22 +456,48 @@ async def twilio_webhook(request: Request) -> Response:
 
 @router.post("/create-estimate", response_model=None)
 async def create_estimate_route(
+    request: Request,
     body: EstimateRequest,
     response_mode: Literal["pdf", "json"] = Query(
         "pdf",
-        description="pdf = download PDF; json = JSON including base64 PDF",
+        description="pdf = download PDF; json = JSON with base64 + absolute pdf_link",
     ),
 ) -> StreamingResponse | dict[str, Any]:
-    result = create_estimate(
-        payload=body.model_dump(mode="python"),
-        include_pdf_base64=(response_mode == "json"),
-    )
+    try:
+        result = create_estimate(
+            payload=body.model_dump(mode="python"),
+            include_pdf_base64=(response_mode == "json"),
+        )
+    except ValidationError as exc:
+        logger.info(
+            "create_estimate REST validation failed estimate_id_hint=%s errors=%s",
+            getattr(body, "estimate_id", None),
+            len(exc.errors()),
+        )
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "Estimate payload failed validation. Use customer + line_items for API, or match create_estimate tool shape.",
+                "errors": exc.errors(),
+            },
+        ) from exc
+    except Exception:
+        logger.exception("create_estimate unexpected failure.")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not build estimate. Check server logs and payload shape.",
+        ) from None
+
+    pdf_url = estimate_pdf_absolute_url(request, str(body.estimate_id))
+    result = result.model_copy(update={"pdf_link": pdf_url})
+
     if response_mode == "json":
         return {
             "estimate": body.model_dump(mode="json"),
             "pricing": result.pricing.model_dump(mode="json"),
             "message": result.message,
             "pdf_base64": result.pdf_base64,
+            "pdf_link": result.pdf_link,
         }
 
     bio = write_estimate_pdf_binary(result)
