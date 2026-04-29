@@ -1,0 +1,441 @@
+"""
+HTTP routes for the Fortis CS agent: Grok chat, Twilio SMS, estimates, health.
+
+Logging and error handling mirror a typical production FastAPI service.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import uuid
+from typing import Any, Literal
+
+import httpx
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel, Field
+from twilio.request_validator import RequestValidator
+from twilio.twiml.messaging_response import MessagingResponse
+
+from fortis_cs_agent.estimate_models import EstimateRequest
+from fortis_cs_agent.estimate_pdf import write_estimate_pdf_binary
+from fortis_cs_agent.knowledge import format_knowledge_context, retrieve_knowledge_snippets
+from fortis_cs_agent.prompts import SYSTEM_PROMPT
+from fortis_cs_agent.tools import CREATE_ESTIMATE_TOOL, create_estimate
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(tags=["fortis"])
+
+XAI_API_KEY = os.getenv("XAI_API_KEY")
+XAI_CHAT_MODEL = os.getenv("XAI_CHAT_MODEL", "grok-2-latest")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://vapnbelrpaxeafospalc.supabase.co")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_VALIDATE = os.getenv("TWILIO_VALIDATE_SIGNATURE", "false").lower() in ("1", "true", "yes")
+
+CONV_TABLE = os.getenv("FORTIS_CONVERSATIONS_TABLE", "fortis_conversations")
+MSG_TABLE = os.getenv("FORTIS_MESSAGES_TABLE", "fortis_messages")
+
+
+# --- Supabase persistence (graceful degrade when unset) --------------------------------
+
+
+def _sb() -> Any:
+    from supabase import create_client
+
+    if not SUPABASE_KEY:
+        return None
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
+def ensure_conversation(
+    *,
+    channel: Literal["sms", "web", "api"],
+    channel_ref: str | None,
+    existing_id: str | None,
+) -> str | None:
+    """Create or reuse a conversation row; returns UUID string or None when DB unavailable."""
+    client = _sb()
+    if client is None:
+        return existing_id or str(uuid.uuid4())
+
+    conv_id = existing_id or str(uuid.uuid4())
+    try:
+        if existing_id:
+            return existing_id
+
+        row = {
+            "id": conv_id,
+            "channel": channel,
+            "channel_ref": channel_ref or "",
+        }
+        client.table(CONV_TABLE).upsert(row).execute()
+        return conv_id
+    except Exception:
+        logger.exception("ensure_conversation failed; using ephemeral id.")
+        return conv_id
+
+
+def find_sms_conversation(sender: str) -> str | None:
+    """Return existing SMS thread id keyed by caller number."""
+    client = _sb()
+    if client is None or not sender:
+        return None
+    try:
+        res = (
+            client.table(CONV_TABLE)
+            .select("id")
+            .eq("channel", "sms")
+            .eq("channel_ref", sender)
+            .limit(1)
+            .execute()
+        )
+        if res.data:
+            return str(res.data[0]["id"])
+    except Exception:
+        logger.exception("find_sms_conversation failed.")
+    return None
+
+
+def append_message(
+    conversation_id: str,
+    *,
+    role: Literal["user", "assistant", "system", "tool"],
+    content: str | None,
+    tool_name: str | None = None,
+    meta: dict[str, Any] | None = None,
+) -> None:
+    client = _sb()
+    if client is None:
+        return
+    try:
+        payload: dict[str, Any] = {
+            "conversation_id": conversation_id,
+            "role": role,
+            "content": content or "",
+        }
+        if tool_name:
+            payload["tool_name"] = tool_name
+        if meta is not None:
+            payload["meta"] = meta
+        client.table(MSG_TABLE).insert(payload).execute()
+    except Exception:
+        logger.exception("append_message skipped for conversation_id=%s", conversation_id)
+
+
+def load_recent_messages(conversation_id: str, limit: int = 40) -> list[dict[str, Any]]:
+    client = _sb()
+    if client is None:
+        return []
+    try:
+        res = (
+            client.table(MSG_TABLE)
+            .select("role,content,tool_name,meta,created_at")
+            .eq("conversation_id", conversation_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        rows = list(reversed(res.data or []))
+        return rows
+    except Exception:
+        logger.exception("load_recent_messages failed for %s", conversation_id)
+        return []
+
+
+# --- xAI Grok -------------------------------------------------------------------------
+
+
+async def _grok_chat(
+    messages: list[dict[str, Any]],
+    *,
+    tools: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    if not XAI_API_KEY:
+        raise HTTPException(status_code=503, detail="XAI_API_KEY is not configured.")
+
+    url = "https://api.x.ai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {XAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    body: dict[str, Any] = {
+        "model": XAI_CHAT_MODEL,
+        "messages": messages,
+        "temperature": 0.35,
+    }
+    if tools:
+        body["tools"] = tools
+        body["tool_choice"] = "auto"
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        r = await client.post(url, headers=headers, json=body)
+        if r.status_code >= 400:
+            logger.error("Grok error %s: %s", r.status_code, r.text[:2000])
+            raise HTTPException(status_code=502, detail="Grok upstream error.")
+        return r.json()
+
+
+def _sanitize_history(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    msgs: list[dict[str, Any]] = []
+    for row in rows:
+        role = row.get("role")
+        content = row.get("content") or ""
+        if role not in ("user", "assistant", "system", "tool"):
+            continue
+        if role == "tool":
+            # Skip replaying opaque tool payloads into Grok unless you store canonical tool messages.
+            continue
+        msgs.append({"role": role, "content": content})
+    return msgs
+
+
+async def run_agent_turn(
+    user_text: str,
+    *,
+    conversation_id: str,
+    augment_knowledge: bool = True,
+) -> str:
+    """Single user message → assistant reply with tool loop."""
+    msgs: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    prev = load_recent_messages(conversation_id, limit=30)
+    msgs.extend(_sanitize_history(prev))
+    knowledge_block = ""
+    if augment_knowledge:
+        snippets = retrieve_knowledge_snippets(user_text)
+        knowledge_block = format_knowledge_context(snippets)
+
+    augmented = user_text
+    if knowledge_block:
+        augmented = knowledge_block + "\n\nCustomer message:\n" + user_text
+    msgs.append({"role": "user", "content": augmented})
+
+    tools_list = [CREATE_ESTIMATE_TOOL]
+
+    grok_msgs = [*msgs]
+
+    while True:
+        data = await _grok_chat(grok_msgs, tools=tools_list)
+        choice = data["choices"][0]["message"]
+        tc = choice.get("tool_calls") or []
+        assistant_msg: dict[str, Any] = {"role": "assistant"}
+        assistant_msg.update(choice)
+
+        grok_msgs.append(assistant_msg)
+
+        if tc:
+            for call in tc:
+                fname = call.get("function", {}).get("name")
+                args_raw = call.get("function", {}).get("arguments") or "{}"
+                try:
+                    args = json.loads(args_raw)
+                except json.JSONDecodeError:
+                    args = {}
+
+                if fname == "create_estimate":
+                    result = create_estimate(payload=args, include_pdf_base64=False)
+                    tool_reply = json.dumps(result.to_tool_dict())
+                    grok_msgs.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call.get("id", "call_estimate"),
+                            "content": tool_reply,
+                        }
+                    )
+                else:
+                    grok_msgs.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call.get("id", "call_unknown"),
+                            "content": json.dumps({"error": "unsupported_tool"}),
+                        }
+                    )
+            continue
+
+        content = choice.get("content") or ""
+        return content.strip() or "(No response text from model.)"
+
+
+# --- Request models -------------------------------------------------------------------
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1)
+    conversation_id: str | None = None
+
+
+class ChatResponse(BaseModel):
+    reply: str
+    conversation_id: str
+
+
+class TestChatRequest(BaseModel):
+    message: str = Field(..., min_length=1)
+
+
+# --- Routes ---------------------------------------------------------------------------
+
+
+@router.get("/health")
+async def health() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "service": "fortis-cs-agent",
+        "grok_configured": bool(XAI_API_KEY),
+        "supabase_configured": bool(SUPABASE_KEY),
+    }
+
+
+@router.post("/chat", response_model=ChatResponse)
+async def chat(req: ChatRequest) -> ChatResponse:
+    cid = ensure_conversation(
+        channel="web",
+        channel_ref=None,
+        existing_id=req.conversation_id,
+    )
+    if not cid:
+        raise HTTPException(status_code=500, detail="Could not allocate conversation.")
+
+    try:
+        reply = await run_agent_turn(req.message, conversation_id=cid)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("chat pipeline failed")
+        raise HTTPException(status_code=500, detail="Chat failed.") from None
+
+    append_message(cid, role="user", content=req.message)
+    append_message(cid, role="assistant", content=reply)
+    return ChatResponse(reply=reply, conversation_id=cid)
+
+
+@router.post("/test-chat", response_model=ChatResponse)
+async def test_chat(req: TestChatRequest) -> ChatResponse:
+    """
+    Ephemeral chat (no Supabase writes). Same model + tools as /chat.
+    """
+    if not XAI_API_KEY:
+        raise HTTPException(status_code=503, detail="XAI_API_KEY is not configured.")
+
+    cid = str(uuid.uuid4())
+    msgs: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    msgs.append({"role": "user", "content": req.message})
+    grok_msgs = [*msgs]
+
+    while True:
+        data = await _grok_chat(grok_msgs, tools=[CREATE_ESTIMATE_TOOL])
+        choice = data["choices"][0]["message"]
+        assistant_msg = {"role": "assistant", **choice}
+        grok_msgs.append(assistant_msg)
+        tc = choice.get("tool_calls") or []
+
+        if tc:
+            for call in tc:
+                fname = call.get("function", {}).get("name")
+                args_raw = call.get("function", {}).get("arguments") or "{}"
+                try:
+                    args = json.loads(args_raw)
+                except json.JSONDecodeError:
+                    args = {}
+                if fname == "create_estimate":
+                    result = create_estimate(payload=args, include_pdf_base64=False)
+                    grok_msgs.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call.get("id", "call_estimate"),
+                            "content": json.dumps(result.to_tool_dict()),
+                        }
+                    )
+            continue
+
+        content = choice.get("content") or ""
+        reply = content.strip() or "(No response text from model.)"
+        break
+
+    return ChatResponse(reply=reply, conversation_id=f"test-{cid}")
+
+
+@router.post("/twilio-webhook")
+async def twilio_webhook(request: Request) -> Response:
+    form = await request.form()
+    signature = request.headers.get("X-Twilio-Signature", "")
+    if TWILIO_VALIDATE and TWILIO_AUTH_TOKEN:
+        # Twilio signs the callback URL configured on the webhook; set TWILIO_WEBHOOK_URL in prod when
+        # the forwarded host differs from the URL Twilio used (tunnel, reverse proxy).
+        validator = RequestValidator(TWILIO_AUTH_TOKEN)
+        url_for_signature = os.getenv("TWILIO_WEBHOOK_URL") or str(request.url)
+        if not validator.validate(url_for_signature, dict(form), signature):
+            raise HTTPException(status_code=403, detail="Invalid Twilio signature.")
+
+    body_text = form.get("Body") or ""
+    from_num = form.get("From") or ""
+
+    if not isinstance(body_text, str) or not body_text.strip():
+        twiml = MessagingResponse()
+        twiml.message("Send your packaging question and we’ll help. For uploads, please use the Fortis Edge Portal.")
+        return Response(content=str(twiml), media_type="application/xml")
+
+    existing = find_sms_conversation(str(from_num))
+    cid = existing or ensure_conversation(
+        channel="sms",
+        channel_ref=str(from_num),
+        existing_id=None,
+    )
+    if not cid:
+        cid = str(uuid.uuid4())
+
+    try:
+        reply_text = await run_agent_turn(body_text, conversation_id=cid, augment_knowledge=True)
+    except Exception:
+        logger.exception("Twilio agent failed — sending fallback SMS.")
+        reply_text = (
+            "We couldn’t reply automatically right now. Please email your Fortis rep or "
+            "use the Fortis Edge Portal for status and file uploads."
+        )
+
+    append_message(cid, role="user", content=body_text)
+    append_message(cid, role="assistant", content=reply_text)
+
+    sms_body = reply_text
+    if len(sms_body) > 1450:
+        sms_body = sms_body[:1420].rstrip() + " … See Fortis Edge Portal."
+
+    twiml = MessagingResponse()
+    twiml.message(sms_body)
+
+    resp = Response(content=str(twiml), media_type="application/xml")
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+@router.post("/create-estimate", response_model=None)
+async def create_estimate_route(
+    body: EstimateRequest,
+    response_mode: Literal["pdf", "json"] = Query(
+        "pdf",
+        description="pdf = download PDF; json = JSON including base64 PDF",
+    ),
+) -> StreamingResponse | dict[str, Any]:
+    result = create_estimate(
+        payload=body.model_dump(mode="python"),
+        include_pdf_base64=(response_mode == "json"),
+    )
+    if response_mode == "json":
+        return {
+            "estimate": body.model_dump(mode="json"),
+            "pricing": result.pricing.model_dump(mode="json"),
+            "message": result.message,
+            "pdf_base64": result.pdf_base64,
+        }
+
+    bio = write_estimate_pdf_binary(result)
+    filename = f"fortis_estimate_{body.estimate_id}.pdf"
+    return StreamingResponse(
+        bio,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
