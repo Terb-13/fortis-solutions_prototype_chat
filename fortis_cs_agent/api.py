@@ -21,7 +21,7 @@ from twilio.twiml.messaging_response import MessagingResponse
 
 from fortis_cs_agent.estimate_models import EstimateRequest
 from fortis_cs_agent.estimate_pdf import write_estimate_pdf_binary
-from fortis_cs_agent.knowledge import format_knowledge_context, retrieve_knowledge_snippets
+from fortis_cs_agent.knowledge import retrieve_knowledge
 from fortis_cs_agent.prompts import SYSTEM_PROMPT
 from fortis_cs_agent.store import load_estimate_snapshot
 from fortis_cs_agent.tools import AGENT_TOOLS, assemble_estimate_result, create_estimate, execute_agent_tool
@@ -252,14 +252,14 @@ async def run_agent_turn(
     msgs: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
     prev = load_recent_messages(conversation_id, limit=30)
     msgs.extend(_sanitize_history(prev))
-    knowledge_block = ""
+    knowledge_context = ""
     if augment_knowledge:
-        snippets = retrieve_knowledge_snippets(user_text)
-        knowledge_block = format_knowledge_context(snippets)
+        knowledge_results = retrieve_knowledge(user_text, limit=4)
+        knowledge_context = "\n\n".join([r["content"] for r in knowledge_results])
 
     augmented = user_text
-    if knowledge_block:
-        augmented = knowledge_block + "\n\nCustomer message:\n" + user_text
+    if knowledge_context:
+        augmented = "Internal knowledge:\n" + knowledge_context + "\n\nCustomer message:\n" + user_text
     msgs.append({"role": "user", "content": augmented})
 
     tools_list = AGENT_TOOLS
