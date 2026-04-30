@@ -47,7 +47,7 @@ See `.env.example`. Important keys:
 | Variable | Purpose |
 |---------|---------|
 | `XAI_API_KEY` | **Required** for `/chat`, `/test-chat`, SMS agent turns |
-| `XAI_CHAT_MODEL` | Defaults to `grok-2-latest` |
+| `XAI_CHAT_MODEL` | Optional; defaults to **`grok-4`** if unset |
 | `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` | Persistence + knowledge table (optional if unset) |
 | `TWILIO_*` | SMS; webhook still returns XML without Twilio if only chat is used |
 | `TWILIO_VALIDATE_SIGNATURE` | Set `true` in production with correct public URL for signature validation |

@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["fortis"])
 
 XAI_API_KEY = os.getenv("XAI_API_KEY")
-XAI_CHAT_MODEL = os.getenv("XAI_CHAT_MODEL", "grok-2-latest")
+XAI_CHAT_MODEL = (os.getenv("XAI_CHAT_MODEL") or "").strip() or "grok-4"
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://vapnbelrpaxeafospalc.supabase.co")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
@@ -191,7 +191,8 @@ async def _grok_chat(
             )
             raise HTTPException(
                 status_code=502,
-                detail="Grok API error. Check XAI_API_KEY, XAI_CHAT_MODEL, and upstream status before retrying.",
+                detail="Grok API error. Check XAI_API_KEY and upstream model availability. "
+                "Optional: set XAI_CHAT_MODEL if your key requires a specific model id.",
             )
         return r.json()
 
