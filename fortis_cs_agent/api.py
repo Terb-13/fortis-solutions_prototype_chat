@@ -228,6 +228,19 @@ async def _grok_chat(
         return r.json()
 
 
+def _recent_user_text_for_pricing(prev: list[dict[str, Any]], user_text: str, *, max_prior: int = 6) -> str:
+    """Merge recent user turns so size/qty/material from earlier messages still inform pricing lookup."""
+    chunks: list[str] = []
+    for row in prev:
+        if row.get("role") != "user":
+            continue
+        c = (row.get("content") or "").strip()
+        if c:
+            chunks.append(c)
+    tail = chunks[-max_prior:] if chunks else []
+    return "\n".join([*tail, user_text])
+
+
 def _sanitize_history(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     msgs: list[dict[str, Any]] = []
     for row in rows:
@@ -255,13 +268,19 @@ async def run_agent_turn(
     knowledge_context = ""
     if augment_knowledge:
         # 1) Always check internal knowledge first.
-        knowledge_results = retrieve_knowledge(user_text, limit=4)
+        try:
+            knowledge_results = retrieve_knowledge(user_text, limit=4)
+        except Exception:
+            logger.exception("retrieve_knowledge failed; continuing without snippets.")
+            knowledge_results = []
         knowledge_context = "\n\n".join([r["content"] for r in knowledge_results])
 
         # 2) Add pricing agent context when user intent is pricing/buying related.
         pricing_results = []
+        pricing_blob = _recent_user_text_for_pricing(prev, user_text)
+        blob_lower = pricing_blob.lower()
         if any(
-            word in user_text.lower()
+            word in blob_lower
             for word in [
                 "price",
                 "cost",
@@ -273,6 +292,9 @@ async def run_agent_turn(
                 "quantity",
                 "qty",
                 "buy",
+                "order",
+                "purchase",
+                "placing an order",
                 "cheapest",
                 "sticker",
                 "label",
@@ -281,12 +303,18 @@ async def run_agent_turn(
                 "dimensions",
                 "width",
                 "height",
+                "cmyk",
+                "printing",
             ]
         ):
-            pricing_results = retrieve_pricing(user_text, limit=5)
+            try:
+                pricing_results = retrieve_pricing(pricing_blob, limit=5)
+            except Exception:
+                logger.exception("retrieve_pricing failed; continuing without pricing rows.")
+                pricing_results = []
 
         if pricing_results:
-            pricing_context = format_pricing_context(pricing_results, user_text)
+            pricing_context = format_pricing_context(pricing_results, pricing_blob)
             knowledge_context = f"{knowledge_context}\n\n{pricing_context}".strip()
 
     augmented = user_text
@@ -298,7 +326,8 @@ async def run_agent_turn(
 
     grok_msgs = [*msgs]
 
-    while True:
+    max_tool_rounds = 14
+    for _ in range(max_tool_rounds):
         try:
             data = await _grok_chat(grok_msgs, tools=tools_list)
         except HTTPException:
@@ -307,7 +336,12 @@ async def run_agent_turn(
             logger.exception("Grok invocation failed in run_agent_turn (conversation_id=%s).", conversation_id)
             raise HTTPException(status_code=502, detail="Upstream model unavailable.") from None
 
-        choice = data["choices"][0]["message"]
+        try:
+            choice = data["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError):
+            logger.exception("Grok returned unexpected response shape (conversation_id=%s).", conversation_id)
+            return "(Something went wrong parsing the assistant response—please try again.)"
+
         tc = choice.get("tool_calls") or []
         assistant_msg: dict[str, Any] = {"role": "assistant"}
         assistant_msg.update(choice)
@@ -325,17 +359,25 @@ async def run_agent_turn(
                     args = {}
 
                 payload = execute_agent_tool(fname or "", args, persist_estimate=True)
+                try:
+                    tool_body = json.dumps(payload, default=str)
+                except Exception:
+                    logger.exception("tool payload json.dumps failed tool=%s", fname)
+                    tool_body = json.dumps({"error": "serialization_failed", "tool": fname})
                 grok_msgs.append(
                     {
                         "role": "tool",
                         "tool_call_id": call.get("id", "call"),
-                        "content": json.dumps(payload),
+                        "content": tool_body,
                     }
                 )
             continue
 
         content = choice.get("content") or ""
         return content.strip() or "(No response text from model.)"
+
+    logger.error("run_agent_turn exceeded max_tool_rounds conversation_id=%s", conversation_id)
+    return "(I hit a processing limit—please resend your question in one message.)"
 
 
 # --- Request models -------------------------------------------------------------------

@@ -1,11 +1,23 @@
+import logging
 import os
 import re
 from typing import Any, Dict, List
+
 from supabase import create_client
+
+logger = logging.getLogger(__name__)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_KEY else None
+
+
+def _safe_ilike_term(raw: str) -> str | None:
+    """Strip characters that break PostgREST `or` / `ilike` filters (commas, quotes, etc.)."""
+    t = re.sub(r"[^a-z0-9.\-x]+", "", (raw or "").lower())
+    if len(t) < 3:
+        return None
+    return t[:48]
 
 
 def retrieve_knowledge(query: str, limit: int = 5) -> List[Dict]:
@@ -16,21 +28,27 @@ def retrieve_knowledge(query: str, limit: int = 5) -> List[Dict]:
     if not supabase or not query:
         return []
 
-    # Split query into keywords
     keywords = [k.strip() for k in query.lower().split() if len(k) > 2]
 
     results = []
     seen_ids = set()
 
-    for keyword in keywords[:6]:  # limit to first 6 keywords
-        res = (
-            supabase.table("fortis_knowledge")
-            .select("id, title, content, category, source")
-            .ilike("content", f"%{keyword}%")
-            .limit(limit)
-            .execute()
-        )
-        for row in res.data:
+    for keyword in keywords[:6]:
+        term = _safe_ilike_term(keyword)
+        if not term:
+            continue
+        try:
+            res = (
+                supabase.table("fortis_knowledge")
+                .select("id, title, content, category, source")
+                .ilike("content", f"%{term}%")
+                .limit(limit)
+                .execute()
+            )
+        except Exception:
+            logger.warning("retrieve_knowledge Supabase query failed term=%r", term, exc_info=True)
+            continue
+        for row in res.data or []:
             if row["id"] not in seen_ids:
                 seen_ids.add(row["id"])
                 results.append(row)
@@ -147,20 +165,27 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
     sku_match = re.search(r"(sticker_[a-z0-9.]+)", query_lower)
     if sku_match:
         sku = sku_match.group(1).upper()
-        res = supabase.table("fortis_pricing").select("*").ilike("sku", f"%{sku}%").limit(1).execute()
-        if res.data:
-            return res.data
+        try:
+            res = supabase.table("fortis_pricing").select("*").ilike("sku", f"%{sku}%").limit(1).execute()
+            if res.data:
+                return res.data
+        except Exception:
+            logger.warning("retrieve_pricing SKU lookup failed sku=%r", sku, exc_info=True)
 
     # 2. Material-aware query path (substring + ILIKE on catalog material)
     mentioned_materials = sorted({m for m in _MATERIAL_HINT_TERMS if m in query_lower})
     for material in mentioned_materials[:3]:
-        res = (
-            supabase.table("fortis_pricing")
-            .select("*")
-            .ilike("material", f"%{material}%")
-            .limit(max(limit * 2, 8))
-            .execute()
-        )
+        try:
+            res = (
+                supabase.table("fortis_pricing")
+                .select("*")
+                .ilike("material", f"%{material}%")
+                .limit(max(limit * 2, 8))
+                .execute()
+            )
+        except Exception:
+            logger.warning("retrieve_pricing material filter failed material=%r", material, exc_info=True)
+            continue
         scored = sorted(
             res.data or [],
             key=lambda r: (-_material_match_score(query_lower, str(r.get("material") or "")), str(r.get("sku"))),
@@ -177,22 +202,31 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
         width_val = float(size_match.group(1))
         height_val = float(size_match.group(2))
         tol = 0.35  # tight tolerance in inches
-        tight = (
-            supabase.table("fortis_pricing")
-            .select("*")
-            .gte("width_in", width_val - tol)
-            .lte("width_in", width_val + tol)
-            .gte("height_in", height_val - tol)
-            .lte("height_in", height_val + tol)
-            .limit(max(limit * 4, 12))
-            .execute()
-        )
-
-        candidates = list(tight.data or [])
+        try:
+            tight = (
+                supabase.table("fortis_pricing")
+                .select("*")
+                .gte("width_in", width_val - tol)
+                .lte("width_in", width_val + tol)
+                .gte("height_in", height_val - tol)
+                .lte("height_in", height_val + tol)
+                .limit(max(limit * 4, 12))
+                .execute()
+            )
+            candidates = list(tight.data or [])
+            if not candidates:
+                broad = supabase.table("fortis_pricing").select("*").limit(150).execute()
+                candidates = list(broad.data or [])
+        except Exception:
+            logger.warning("retrieve_pricing size-bucket query failed", exc_info=True)
+            candidates = []
         if not candidates:
-            # No close bounded hits: fetch a broader set and rank by nearest size.
-            broad = supabase.table("fortis_pricing").select("*").limit(150).execute()
-            candidates = list(broad.data or [])
+            try:
+                broad = supabase.table("fortis_pricing").select("*").limit(150).execute()
+                candidates = list(broad.data or [])
+            except Exception:
+                logger.warning("retrieve_pricing broad fetch failed", exc_info=True)
+                candidates = []
 
         def _distance(row: dict[str, Any]) -> float:
             try:
@@ -225,14 +259,21 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
 
     # 4. Keyword search across material, description, notes
     keywords = [k for k in query_lower.split() if len(k) > 2]
-    for keyword in keywords[:4]:
-        res = (
-            supabase.table("fortis_pricing")
-            .select("*")
-            .or_(f"description.ilike.%{keyword}%,material.ilike.%{keyword}%,notes.ilike.%{keyword}%")
-            .limit(limit)
-            .execute()
-        )
+    for keyword in keywords[:6]:
+        term = _safe_ilike_term(keyword)
+        if not term:
+            continue
+        try:
+            res = (
+                supabase.table("fortis_pricing")
+                .select("*")
+                .or_(f"description.ilike.%{term}%,material.ilike.%{term}%,notes.ilike.%{term}%")
+                .limit(limit)
+                .execute()
+            )
+        except Exception:
+            logger.warning("retrieve_pricing keyword OR failed term=%r", term, exc_info=True)
+            continue
         for row in res.data or []:
             if row not in results:
                 results.append(row)
@@ -240,6 +281,32 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
                     return results
 
     return results
+
+
+def _extract_quantity_from_query(query_lower: str) -> int | None:
+    for pat in (
+        r"\bquantity\s*(?:is|are|=|:)?\s*(\d{1,6})\b",
+        r"\bqty\s*(?:is|are|=|:)?\s*(\d{1,6})\b",
+        r"\b(\d{1,6})\s*(?:labels|units)\b",
+    ):
+        m = re.search(pat, query_lower)
+        if m:
+            q = int(m.group(1))
+            if 1 <= q <= 999_999:
+                return q
+    m = re.search(r"\b(\d{2,6})\b", query_lower)
+    if m:
+        q = int(m.group(1))
+        if 10 <= q <= 999_999:
+            return q
+    return None
+
+
+def _extract_size_tuple(query_lower: str) -> tuple[float, float] | None:
+    m = re.search(r"(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)", query_lower)
+    if not m:
+        return None
+    return float(m.group(1)), float(m.group(2))
 
 
 def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
@@ -250,8 +317,7 @@ def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
         return ""
 
     query_lower = query.lower()
-    qty_match = re.search(r"\b(\d{2,6})\b", query_lower)
-    qty = int(qty_match.group(1)) if qty_match else None
+    qty = _extract_quantity_from_query(query_lower)
 
     qty_key = "cost_1000"
     if qty is not None:
@@ -277,6 +343,19 @@ def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
             qty_key = "cost_100"
 
     needs_material_prompt = not _user_mentioned_material(query_lower)
+    size_tuple = _extract_size_tuple(query_lower)
+    asks_finish_options = any(
+        phrase in query_lower
+        for phrase in (
+            "finish",
+            "what options",
+            "which options",
+            "options do",
+            "kind of finish",
+            "gloss or matte",
+            "matte or gloss",
+        )
+    )
 
     lines: list[str] = []
     for row in rows[:5]:
@@ -310,7 +389,36 @@ def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
             + "; ".join(distinct_materials[:4])
         )
 
-    if needs_material_prompt:
+    distinct_finishes: list[str] = []
+    seen_f: set[str] = set()
+    for row in rows[:12]:
+        f = (row.get("finish") or "").strip()
+        if not f:
+            continue
+        key = f.lower()
+        if key not in seen_f:
+            seen_f.add(key)
+            distinct_finishes.append(f)
+
+    if distinct_finishes:
+        parts.append("Finishes on closest matches (answer finish questions from this list only): " + "; ".join(distinct_finishes[:6]))
+
+    memory_hints: list[str] = []
+    if size_tuple:
+        memory_hints.append(f"User stated size ~{size_tuple[0]}x{size_tuple[1]} in.; do not ask for dimensions again.")
+    if qty is not None:
+        memory_hints.append(f"User stated quantity {qty}; do not ask quantity again unless clarifying.")
+    if _user_mentioned_material(query_lower):
+        memory_hints.append("User stated or chose a material direction; do not re-explain unrelated product categories.")
+    if memory_hints:
+        parts.append("Conversation discipline: " + " ".join(memory_hints))
+
+    if asks_finish_options and distinct_finishes:
+        parts.append(
+            "Finish step: User asked what finish options exist — give a one-line summary (e.g. gloss vs matte) "
+            "using the finishes listed above only; then ask which they prefer."
+        )
+    elif needs_material_prompt:
         parts.append(
             "Material step (required): User did not specify material/finish. Ask which material they prefer "
             "(e.g. white BOPP vs paper vs vinyl) and offer to compare 2–3 close options from the list above. "
@@ -318,12 +426,12 @@ def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
         )
     else:
         parts.append(
-            "Material step: User hinted at material — confirm their preference and mention the closest matching "
-            "row(s); offer one adjacent alternative if useful."
+            "Material step: User hinted at material — briefly confirm and pick the closest catalog row; "
+            "keep BOPP explanation to one short clause."
         )
 
     parts.append(
-        "Guided follow-up: Ask quantity if missing; then confirm material/finish; keep the reply short."
+        "Guided follow-up: One question only when possible; stay on labels if they are quoting labels."
     )
 
     return "\n".join(parts)

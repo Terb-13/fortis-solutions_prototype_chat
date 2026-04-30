@@ -491,26 +491,30 @@ def execute_agent_tool(
     args = raw_args or {}
     logger.debug("execute_agent_tool name=%s persist_estimate=%s", fn, persist_estimate)
 
-    if fn == "create_estimate":
-        try:
-            result = create_estimate(
-                payload=args,
-                include_pdf_base64=False,
-                persist_snapshot=persist_estimate,
-            )
-            return result.to_tool_dict()
-        except ValidationError as exc:
-            return _tool_validation_error_payload(exc)
+    try:
+        if fn == "create_estimate":
+            try:
+                result = create_estimate(
+                    payload=args,
+                    include_pdf_base64=False,
+                    persist_snapshot=persist_estimate,
+                )
+                return result.to_tool_dict()
+            except ValidationError as exc:
+                return _tool_validation_error_payload(exc)
 
-    if fn == "get_portal_status":
-        return get_portal_status()
+        if fn == "get_portal_status":
+            return get_portal_status()
 
-    if fn == "get_sbu_metrics":
-        return get_sbu_metrics(sbu_hint=args.get("sbu_hint"))
+        if fn == "get_sbu_metrics":
+            return get_sbu_metrics(sbu_hint=args.get("sbu_hint"))
 
-    if fn == "search_products":
-        q = args.get("query") or ""
-        return search_products(query=str(q))
+        if fn == "search_products":
+            q = args.get("query") or ""
+            return search_products(query=str(q))
 
-    logger.warning("unknown_tool name=%s", fn)
-    return {"error": "unknown_tool", "message": f"No handler for `{fn}`."}
+        logger.warning("unknown_tool name=%s", fn)
+        return {"error": "unknown_tool", "message": f"No handler for `{fn}`."}
+    except Exception as exc:
+        logger.exception("execute_agent_tool failed name=%s", fn)
+        return {"error": "tool_failed", "message": str(exc)[:600]}
