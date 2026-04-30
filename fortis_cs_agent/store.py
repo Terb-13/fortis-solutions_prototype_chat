@@ -21,17 +21,22 @@ logger = logging.getLogger(__name__)
 
 EST_TABLE = os.getenv("FORTIS_ESTIMATES_TABLE", "fortis_estimates")
 
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+_SUPABASE_RESOLVED_URL = SUPABASE_URL or "https://vapnbelrpaxeafospalc.supabase.co"
+
+if SUPABASE_KEY:
+    from supabase import create_client
+
+    supabase = create_client(_SUPABASE_RESOLVED_URL, SUPABASE_KEY)
+else:
+    supabase = None
+
 _LOCAL: dict[str, dict[str, Any]] = {}
 
 
 def _sb() -> Any | None:
-    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-    if not key:
-        return None
-    url = os.getenv("SUPABASE_URL", "https://vapnbelrpaxeafospalc.supabase.co")
-    from supabase import create_client
-
-    return create_client(url, key)
+    return supabase
 
 
 def save_estimate_snapshot(est: EstimateRequest) -> None:

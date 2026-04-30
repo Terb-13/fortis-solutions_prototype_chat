@@ -32,8 +32,16 @@ router = APIRouter(tags=["fortis"])
 
 XAI_API_KEY = os.getenv("XAI_API_KEY")
 XAI_CHAT_MODEL = (os.getenv("XAI_CHAT_MODEL") or "").strip() or "grok-4"
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://vapnbelrpaxeafospalc.supabase.co")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+_SUPABASE_RESOLVED_URL = SUPABASE_URL or "https://vapnbelrpaxeafospalc.supabase.co"
+
+if SUPABASE_KEY:
+    from supabase import create_client
+
+    supabase = create_client(_SUPABASE_RESOLVED_URL, SUPABASE_KEY)
+else:
+    supabase = None
 
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_VALIDATE = os.getenv("TWILIO_VALIDATE_SIGNATURE", "false").lower() in ("1", "true", "yes")
@@ -54,11 +62,7 @@ def estimate_pdf_absolute_url(request: Request, estimate_id: str) -> str:
 
 
 def _sb() -> Any:
-    from supabase import create_client
-
-    if not SUPABASE_KEY:
-        return None
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
+    return supabase
 
 
 def ensure_conversation(
@@ -324,7 +328,7 @@ async def health() -> dict[str, Any]:
         "service": "fortis-cs-agent",
         "grok_configured": bool(XAI_API_KEY),
         "grok_model": XAI_CHAT_MODEL,
-        "supabase_configured": bool(SUPABASE_KEY),
+        "supabase_configured": supabase is not None,
     }
 
 

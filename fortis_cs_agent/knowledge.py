@@ -17,21 +17,28 @@ import os
 import re
 from typing import Any
 
-from supabase import Client, create_client
+from supabase import Client
 
 logger = logging.getLogger(__name__)
 
-_SUPABASE_URL = os.getenv("SUPABASE_URL", "https://vapnbelrpaxeafospalc.supabase.co")
-_SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+_SUPABASE_RESOLVED_URL = SUPABASE_URL or "https://vapnbelrpaxeafospalc.supabase.co"
+
+supabase: Client | None = None
+if SUPABASE_KEY:
+    from supabase import create_client
+
+    supabase = create_client(_SUPABASE_RESOLVED_URL, SUPABASE_KEY)
+else:
+    logger.warning("SUPABASE_SERVICE_ROLE_KEY missing — knowledge retrieval disabled.")
+
 _KNOWLEDGE_TABLE = os.getenv("FORTIS_KNOWLEDGE_TABLE", "fortis_knowledge_chunks")
 _MAX_ROWS = int(os.getenv("FORTIS_KNOWLEDGE_LIMIT", "8"))
 
 
 def _get_client() -> Client | None:
-    if not _SUPABASE_KEY:
-        logger.warning("SUPABASE_SERVICE_ROLE_KEY missing — knowledge retrieval disabled.")
-        return None
-    return create_client(_SUPABASE_URL, _SUPABASE_KEY)
+    return supabase
 
 
 def retrieve_knowledge_snippets(query: str, *, limit: int | None = None) -> list[dict[str, Any]]:
