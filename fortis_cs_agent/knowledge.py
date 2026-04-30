@@ -419,9 +419,15 @@ def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
             closest = rows[0]
             cw = closest.get("width_in")
             ch = closest.get("height_in")
+            cmat = closest.get("material") or "N/A"
+            cfinish = closest.get("finish") or "N/A"
             parts.append(
                 f"Catalog truth: No exact {tw}×{th} in. row in this pricing snapshot — closest row shown is "
                 f"{cw}×{ch} in. Say that clearly; do not imply an exact {tw}×{th} die exists unless it appears above."
+            )
+            parts.append(
+                f"Closest-size recommendation: Direct the customer to {cw}×{ch} in. as the nearest available option "
+                f"(material: {cmat}; finish: {cfinish}). Ask if they want to proceed with this nearest size or request custom tooling."
             )
 
     if rows and any(
