@@ -21,7 +21,7 @@ from twilio.twiml.messaging_response import MessagingResponse
 
 from fortis_cs_agent.estimate_models import EstimateRequest
 from fortis_cs_agent.estimate_pdf import write_estimate_pdf_binary
-from fortis_cs_agent.knowledge import retrieve_knowledge
+from fortis_cs_agent.knowledge import retrieve_knowledge, retrieve_pricing
 from fortis_cs_agent.prompts import SYSTEM_PROMPT
 from fortis_cs_agent.store import load_estimate_snapshot
 from fortis_cs_agent.tools import AGENT_TOOLS, assemble_estimate_result, create_estimate, execute_agent_tool
@@ -256,6 +256,20 @@ async def run_agent_turn(
     if augment_knowledge:
         knowledge_results = retrieve_knowledge(user_text, limit=4)
         knowledge_context = "\n\n".join([r["content"] for r in knowledge_results])
+
+        pricing_results = []
+        if any(word in user_text.lower() for word in ["price", "cost", "how much", "pricing", "quote"]):
+            pricing_results = retrieve_pricing(user_text, limit=3)
+
+        if pricing_results:
+            pricing_context = "\n\n**Pricing Information:**\n" + "\n".join(
+                [
+                    f"- {r['sku']}: {r['description']} | Material: {r['material']} | {r['finish']} | "
+                    f"Cost@5k: ${r['cost_5000']}"
+                    for r in pricing_results
+                ]
+            )
+            knowledge_context += pricing_context
 
     augmented = user_text
     if knowledge_context:
