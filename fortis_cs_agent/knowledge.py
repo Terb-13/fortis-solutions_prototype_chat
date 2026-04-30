@@ -309,6 +309,50 @@ def _extract_size_tuple(query_lower: str) -> tuple[float, float] | None:
     return float(m.group(1)), float(m.group(2))
 
 
+def _qty_to_cost_key(qty: int) -> str:
+    if qty >= 5000:
+        return "cost_5000"
+    if qty >= 4000:
+        return "cost_4000"
+    if qty >= 3000:
+        return "cost_3000"
+    if qty >= 2500:
+        return "cost_2500"
+    if qty >= 2000:
+        return "cost_2000"
+    if qty >= 1500:
+        return "cost_1500"
+    if qty >= 1000:
+        return "cost_1000"
+    if qty >= 500:
+        return "cost_500"
+    if qty >= 250:
+        return "cost_250"
+    return "cost_100"
+
+
+def _mentioned_qty_tiers(query_lower: str) -> list[int]:
+    """Detect standard order quantities the user wants compared (500 / 1000 / 2500)."""
+    standard = (100, 250, 500, 1000, 1500, 2000, 2500, 3000, 4000, 5000)
+    found: list[int] = []
+    for n in standard:
+        if re.search(rf"\b{n}\b", query_lower):
+            found.append(n)
+    return found
+
+
+def _exact_row_for_size(rows: list[dict[str, Any]], tw: float, th: float, eps: float = 0.0001) -> bool:
+    for row in rows:
+        try:
+            w = float(row.get("width_in") or 0)
+            h = float(row.get("height_in") or 0)
+        except (TypeError, ValueError):
+            continue
+        if abs(w - tw) <= eps and abs(h - th) <= eps:
+            return True
+    return False
+
+
 def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
     """
     Build compact pricing context with guided next-step hints for the model.
@@ -319,28 +363,7 @@ def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
     query_lower = query.lower()
     qty = _extract_quantity_from_query(query_lower)
 
-    qty_key = "cost_1000"
-    if qty is not None:
-        if qty >= 5000:
-            qty_key = "cost_5000"
-        elif qty >= 4000:
-            qty_key = "cost_4000"
-        elif qty >= 3000:
-            qty_key = "cost_3000"
-        elif qty >= 2500:
-            qty_key = "cost_2500"
-        elif qty >= 2000:
-            qty_key = "cost_2000"
-        elif qty >= 1500:
-            qty_key = "cost_1500"
-        elif qty >= 1000:
-            qty_key = "cost_1000"
-        elif qty >= 500:
-            qty_key = "cost_500"
-        elif qty >= 250:
-            qty_key = "cost_250"
-        else:
-            qty_key = "cost_100"
+    qty_key = _qty_to_cost_key(qty) if qty is not None else "cost_1000"
 
     needs_material_prompt = not _user_mentioned_material(query_lower)
     size_tuple = _extract_size_tuple(query_lower)
@@ -356,6 +379,8 @@ def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
             "matte or gloss",
         )
     )
+
+    tier_qtys = _mentioned_qty_tiers(query_lower)
 
     lines: list[str] = []
     for row in rows[:5]:
@@ -381,7 +406,45 @@ def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
             seen_m.add(key)
             distinct_materials.append(m)
 
-    parts = ["Pricing Agent Context:", "\n".join(lines)]
+    parts = [
+        "Pricing Agent Context (Quick Ship labels / fortis_pricing ONLY — not pouches, shipper boxes, or unrelated packaging):",
+        "\n".join(lines),
+    ]
+
+    if size_tuple:
+        tw, th = size_tuple
+        if _exact_row_for_size(rows, tw, th):
+            parts.append(f"Catalog truth: An exact {tw}×{th} in. row exists in the snapshot below.")
+        else:
+            closest = rows[0]
+            cw = closest.get("width_in")
+            ch = closest.get("height_in")
+            parts.append(
+                f"Catalog truth: No exact {tw}×{th} in. row in this pricing snapshot — closest row shown is "
+                f"{cw}×{ch} in. Say that clearly; do not imply an exact {tw}×{th} die exists unless it appears above."
+            )
+
+    if rows and any(
+        "bopp" in str(r.get("material") or "").lower()
+        for r in rows[:5]
+    ):
+        parts.append(
+            "BOPP check: At least one listed row uses BOPP-family material in the material column — cite those rows only."
+        )
+
+    if len(rows) == 1:
+        parts.append(
+            "Limited catalog: Only one pricing row is loaded — offer qualitative alternatives (paper vs vinyl) only as "
+            "general guidance, not as priced SKUs, unless additional rows appear above."
+        )
+
+    if tier_qtys and len(tier_qtys) >= 2 and rows:
+        prime = rows[0]
+        tier_bits = []
+        for n in tier_qtys[:5]:
+            ck = _qty_to_cost_key(n)
+            tier_bits.append(f"{n} qty → {ck}={prime.get(ck)}")
+        parts.append("Customer requested multiple qty breakpoints (use these indicative totals): " + "; ".join(tier_bits))
 
     if distinct_materials:
         parts.append(
@@ -413,16 +476,35 @@ def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
     if memory_hints:
         parts.append("Conversation discipline: " + " ".join(memory_hints))
 
+    wants_more_opts = any(
+        phrase in query_lower
+        for phrase in (
+            "2-3",
+            "2–3",
+            "two or three",
+            "few options",
+            "close options",
+            "compare",
+            "alternatives",
+        )
+    )
+
     if asks_finish_options and distinct_finishes:
         parts.append(
             "Finish step: User asked what finish options exist — give a one-line summary (e.g. gloss vs matte) "
             "using the finishes listed above only; then ask which they prefer."
         )
-    elif needs_material_prompt:
+    elif needs_material_prompt and not wants_more_opts:
         parts.append(
-            "Material step (required): User did not specify material/finish. Ask which material they prefer "
-            "(e.g. white BOPP vs paper vs vinyl) and offer to compare 2–3 close options from the list above. "
-            "Do not assume one material without confirming."
+            "Material step: User did not specify material/finish. Ask once which material they prefer "
+            "(e.g. white BOPP vs paper vs vinyl). Offer up to 2–3 options only from rows listed above — "
+            "never substitute pouch/film flexible-packaging examples."
+        )
+    elif wants_more_opts:
+        parts.append(
+            "Options step: User asked for more options — reply ONLY with separate rows from the list above "
+            "(different material/finish/SKU lines). If only one row exists, say so honestly and describe trade-offs briefly "
+            "without inventing SKUs or pouch pricing."
         )
     else:
         parts.append(
@@ -431,7 +513,10 @@ def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
         )
 
     parts.append(
-        "Guided follow-up: One question only when possible; stay on labels if they are quoting labels."
+        "Formal PDF: When user gives contact name + company name + email, call create_estimate and paste pdf_link from the tool result."
+    )
+    parts.append(
+        "Guided follow-up: One question only when possible; labels only — never pivot to pouches/corrugated unless the user asks."
     )
 
     return "\n".join(parts)

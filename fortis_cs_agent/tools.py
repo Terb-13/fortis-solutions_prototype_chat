@@ -47,15 +47,22 @@ CREATE_ESTIMATE_TOOL: dict[str, Any] = {
         "name": "create_estimate",
         "description": (
             "Generate a Fortis Edge indicative estimate PDF link + totals. "
-            "Use when internal teams need structured quotes, BOM-style line items, or exportable PDFs. "
-            "Do not call until you have customer_name, email (if known), and each product's type + quantity. "
-            "Use realistic width/height in inches when structures matter; otherwise omit and note assumptions."
+            "Call as soon as you have: customer_name (contact person), company (business name — ask if missing), "
+            "email (required for routing), product_type (usually pressure_sensitive_labels for Quick Ship labels), "
+            "quantity, width/height in inches when known (use catalog nearest match from pricing context if needed), "
+            "material/finish, colors (e.g. CMYK). "
+            "After calling: include the tool's pdf_link verbatim in your reply so the user can open the PDF. "
+            "Do not invent alternate URLs. "
+            "If PUBLIC_BASE_URL is unset server-side, pdf_link may be a relative path — still pass it through."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "customer_name": {"type": "string", "description": "Primary contact full name"},
-                "company": {"type": "string"},
+                "company": {
+                    "type": "string",
+                    "description": "Customer company / organization name (ask explicitly before formal PDF)",
+                },
                 "email": {"type": "string", "description": "Work email for PDF + Portal routing"},
                 "phone": {"type": "string"},
                 "products": {

@@ -267,55 +267,62 @@ async def run_agent_turn(
     msgs.extend(_sanitize_history(prev))
     knowledge_context = ""
     if augment_knowledge:
-        # 1) Always check internal knowledge first.
-        try:
-            knowledge_results = retrieve_knowledge(user_text, limit=4)
-        except Exception:
-            logger.exception("retrieve_knowledge failed; continuing without snippets.")
-            knowledge_results = []
-        knowledge_context = "\n\n".join([r["content"] for r in knowledge_results])
-
-        # 2) Add pricing agent context when user intent is pricing/buying related.
-        pricing_results = []
         pricing_blob = _recent_user_text_for_pricing(prev, user_text)
         blob_lower = pricing_blob.lower()
-        if any(
-            word in blob_lower
-            for word in [
-                "price",
-                "cost",
-                "how much",
-                "pricing",
-                "quote",
-                "material",
-                "finish",
-                "quantity",
-                "qty",
-                "buy",
-                "order",
-                "purchase",
-                "placing an order",
-                "cheapest",
-                "sticker",
-                "label",
-                "size",
-                "dimension",
-                "dimensions",
-                "width",
-                "height",
-                "cmyk",
-                "printing",
-            ]
-        ):
+        pricing_intent_tokens = (
+            "price",
+            "cost",
+            "how much",
+            "pricing",
+            "quote",
+            "estimate",
+            "material",
+            "finish",
+            "quantity",
+            "qty",
+            "buy",
+            "order",
+            "purchase",
+            "placing an order",
+            "cheapest",
+            "sticker",
+            "label",
+            "size",
+            "dimension",
+            "dimensions",
+            "width",
+            "height",
+            "cmyk",
+            "printing",
+            "pdf",
+            "formal",
+        )
+        pricing_intent = any(word in blob_lower for word in pricing_intent_tokens)
+
+        pricing_results: list[dict[str, Any]] = []
+        if pricing_intent:
             try:
                 pricing_results = retrieve_pricing(pricing_blob, limit=5)
             except Exception:
                 logger.exception("retrieve_pricing failed; continuing without pricing rows.")
                 pricing_results = []
 
+        # When label pricing rows exist, DO NOT mix in fortis_knowledge (training transcripts can mention pouches, etc.).
         if pricing_results:
-            pricing_context = format_pricing_context(pricing_results, pricing_blob)
-            knowledge_context = f"{knowledge_context}\n\n{pricing_context}".strip()
+            knowledge_context = format_pricing_context(pricing_results, pricing_blob)
+        elif pricing_intent:
+            knowledge_context = (
+                "Quick Ship label pricing: No fortis_pricing rows matched this thread yet. "
+                "Stay on pressure-sensitive labels; do not cite pouch / flexible film / PET laminate examples or unrelated internal stories as pricing. "
+                "Collect company name, contact name, email, size, qty, material/finish; then call create_estimate for pdf_link."
+            )
+        else:
+            try:
+                knowledge_results = retrieve_knowledge(user_text, limit=4)
+            except Exception:
+                logger.exception("retrieve_knowledge failed; continuing without snippets.")
+                knowledge_results = []
+            knowledge_context = "\n\n".join([r["content"] for r in knowledge_results])
 
     augmented = user_text
     if knowledge_context:
@@ -326,7 +333,7 @@ async def run_agent_turn(
 
     grok_msgs = [*msgs]
 
-    max_tool_rounds = 14
+    max_tool_rounds = 10
     for _ in range(max_tool_rounds):
         try:
             data = await _grok_chat(grok_msgs, tools=tools_list)
