@@ -13,8 +13,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from fortis_cs_agent.api import router as fortis_router
 
@@ -38,3 +41,26 @@ app.add_middleware(
 )
 
 app.include_router(fortis_router)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    """Many frontends read `error` instead of FastAPI's default `detail` only."""
+    detail = exc.detail
+    if isinstance(detail, str):
+        payload: dict = {"detail": detail, "error": detail}
+    else:
+        payload = {"detail": detail, "error": "Request failed. See detail."}
+    return JSONResponse(status_code=exc.status_code, content=payload)
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": exc.errors(),
+            "error": "Invalid request body or query parameters.",
+        },
+    )
+

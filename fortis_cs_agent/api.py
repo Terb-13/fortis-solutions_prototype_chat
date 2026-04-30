@@ -159,6 +159,29 @@ def load_recent_messages(conversation_id: str, limit: int = 40) -> list[dict[str
 # --- xAI Grok -------------------------------------------------------------------------
 
 
+def _parse_grok_error_body(r: httpx.Response) -> str:
+    """Short summary of xAI / OpenAI-style error JSON for logs and HTTP detail."""
+    raw = (r.text or "").strip()
+    if not raw:
+        return "(empty response body)"
+    try:
+        data = r.json()
+        err = data.get("error")
+        if isinstance(err, dict):
+            parts = [str(x) for x in (err.get("message"), err.get("code")) if x]
+            if err.get("type"):
+                parts.append(str(err["type"]))
+            return " | ".join(parts) if parts else raw[:400]
+        if isinstance(err, str):
+            return err[:400]
+        msg = data.get("message")
+        if isinstance(msg, str):
+            return msg[:400]
+    except Exception:
+        pass
+    return raw[:500]
+
+
 async def _grok_chat(
     messages: list[dict[str, Any]],
     *,
@@ -184,15 +207,19 @@ async def _grok_chat(
     async with httpx.AsyncClient(timeout=120.0) as client:
         r = await client.post(url, headers=headers, json=body)
         if r.status_code >= 400:
+            upstream = _parse_grok_error_body(r)
             logger.error(
-                "Grok API HTTP %s body_prefix=%s",
+                "Grok API HTTP %s model=%s upstream=%s",
                 r.status_code,
-                (r.text or "")[:1200].replace("\n", " "),
+                XAI_CHAT_MODEL,
+                upstream.replace("\n", " ")[:1200],
             )
             raise HTTPException(
                 status_code=502,
-                detail="Grok API error. Check XAI_API_KEY and upstream model availability. "
-                "Optional: set XAI_CHAT_MODEL if your key requires a specific model id.",
+                detail=(
+                    f"Grok API error ({r.status_code}, model={XAI_CHAT_MODEL}): {upstream}. "
+                    "Check XAI_API_KEY and model access; set XAI_CHAT_MODEL to a model your key supports."
+                ),
             )
         return r.json()
 
@@ -296,6 +323,7 @@ async def health() -> dict[str, Any]:
         "status": "ok",
         "service": "fortis-cs-agent",
         "grok_configured": bool(XAI_API_KEY),
+        "grok_model": XAI_CHAT_MODEL,
         "supabase_configured": bool(SUPABASE_KEY),
     }
 
