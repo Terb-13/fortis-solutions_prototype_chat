@@ -93,15 +93,50 @@ def ingest_sbu_status():
 
 # === 2. Pricing Grid ===
 def ingest_pricing():
-    df = pd.read_excel(TRAINING_DIR / "Portal Quick Ship Labels.xlsx", header=None)
-    content = "\n".join([" | ".join([str(x) for x in row.values if pd.notna(x)]) for _, row in df.iterrows()])
-    insert_knowledge(
-        source="pricing-grid",
-        category="pricing",
-        title="Portal Quick Ship Labels Pricing",
-        content=content,
-        date="2026-04-13",
-    )
+    import pandas as pd
+    from supabase import create_client
+    import os
+
+    SUPABASE_URL = os.getenv("SUPABASE_URL") or env_file_values.get("SUPABASE_URL")
+    SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or env_file_values.get("SUPABASE_SERVICE_ROLE_KEY")
+    pricing_supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+    df = pd.read_excel(TRAINING_DIR / "Portal Quick Ship Labels.xlsx")
+
+    # Clean column names
+    df.columns = [c.strip().lower().replace(" ", "_").replace("/", "_").replace("(", "").replace(")", "") for c in df.columns]
+
+    for _, row in df.iterrows():
+        try:
+            pricing_supabase.table("fortis_pricing").insert(
+                {
+                    "sku": str(row.get("sku__die_#_generated", "")),
+                    "description": str(row.get("comment__application", "")),
+                    "shape": str(row.get("shape", "")),
+                    "width_in": row.get("width_in"),
+                    "height_in": row.get("height_in"),
+                    "material": str(row.get("material", "")),
+                    "finish": str(row.get("finish", "")),
+                    "gsm": int(row.get("gsm", 0)) if pd.notna(row.get("gsm")) else None,
+                    "print_device": str(row.get("print_device", "")),
+                    "cost_100": row.get("cost@100"),
+                    "cost_250": row.get("cost@250"),
+                    "cost_500": row.get("cost@500"),
+                    "cost_1000": row.get("cost@1k"),
+                    "cost_1500": row.get("cost@1.5k"),
+                    "cost_2000": row.get("cost@2k"),
+                    "cost_2500": row.get("cost@2.5k"),
+                    "cost_3000": row.get("cost@3k"),
+                    "cost_4000": row.get("cost@4k"),
+                    "cost_5000": row.get("cost@5k"),
+                    "notes": str(row.get("notes__ganging__tow_priority", "")),
+                    "ganging_priority": str(row.get("notes__ganging__tow_priority", "")),
+                }
+            ).execute()
+        except Exception as e:
+            print(f"Error inserting row: {e}")
+
+    print("✅ Pricing data ingested into fortis_pricing table.")
 
 
 # === 3. Emails ===
