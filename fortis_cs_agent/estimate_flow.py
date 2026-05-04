@@ -67,7 +67,14 @@ def _extract_quantity(text_lower: str) -> int | None:
 
 
 def _extract_dimensions(text_lower: str) -> bool:
-    return re.search(r"(\d+(?:\.\d+)?)\s*[x×]\s*(\d+(?:\.\d+)?)", text_lower) is not None
+    return (
+        re.search(
+            r"(\d+(?:\.\d+)?)\s*(?:x|×|\bby\b)\s*(\d+(?:\.\d+)?)",
+            text_lower,
+            re.IGNORECASE,
+        )
+        is not None
+    )
 
 
 def _looks_like_email(s: str) -> bool:

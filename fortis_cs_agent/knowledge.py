@@ -150,30 +150,166 @@ def _material_match_score(query_lower: str, material: str) -> float:
     return score
 
 
+_ROW_SIZE_TOL_IN = 0.35
+
+
+def _row_matches_size_tolerance(row: dict[str, Any], tw: float, th: float, tol: float) -> bool:
+    try:
+        rw = float(row.get("width_in") or 0)
+        rh = float(row.get("height_in") or 0)
+    except (TypeError, ValueError):
+        return False
+    return abs(rw - tw) <= tol and abs(rh - th) <= tol
+
+
+def _annotate_pricing_rows(
+    rows: list[dict[str, Any]],
+    query_lower: str,
+    *,
+    how: str,
+    tol: float = _ROW_SIZE_TOL_IN,
+) -> list[dict[str, Any]]:
+    """Copy rows and set ``_fortis_pricing_match`` for downstream prompts."""
+
+    sz = _extract_size_tuple(query_lower)
+    tw, th = sz if sz else (None, None)
+
+    def _match_tag(row: dict[str, Any]) -> str:
+        if how == "sku":
+            return "sku_exact"
+        exact = tw is not None and th is not None and _row_matches_size_tolerance(row, tw, th, tol)
+
+        if tw is None or th is None:
+            if how == "material":
+                return "material_match"
+            if how == "keyword":
+                return "keyword_match"
+            if how == "fallback":
+                return "closest_fallback"
+            return "catalog_match"
+
+        if exact:
+            return "exact_size"
+        return "closest_fallback" if how == "fallback" else "closest_size"
+
+    return [{**dict(r), "_fortis_pricing_match": _match_tag(r)} for r in rows]
+
+
+def _closest_pricing_fallback(query_lower: str, limit: int) -> list[dict[str, Any]]:
+    """When targeted paths yield nothing — broad fetch + nearest size/material scoring."""
+
+    if not supabase:
+        return []
+
+    mentioned_materials = sorted({m for m in _MATERIAL_HINT_TERMS if m in query_lower})
+    size_tuple = _extract_size_tuple(query_lower)
+    pool: list[dict[str, Any]] = []
+    seen: set[Any] = set()
+
+    try:
+        for material in mentioned_materials[:3]:
+            res = (
+                supabase.table("fortis_pricing")
+                .select("*")
+                .ilike("material", f"%{material}%")
+                .limit(120)
+                .execute()
+            )
+            for row in res.data or []:
+                rid = row.get("id")
+                if rid not in seen:
+                    seen.add(rid)
+                    pool.append(dict(row))
+
+        if len(pool) < max(limit * 2, 16):
+            extra = supabase.table("fortis_pricing").select("*").limit(220).execute()
+            for row in extra.data or []:
+                rid = row.get("id")
+                if rid not in seen:
+                    seen.add(rid)
+                    pool.append(dict(row))
+    except Exception:
+        logger.warning("_closest_pricing_fallback fetch failed", exc_info=True)
+        return []
+
+    if not pool:
+        return []
+
+    if size_tuple:
+        tw, th = size_tuple
+
+        def _distance(row: dict[str, Any]) -> float:
+            try:
+                rw = float(row.get("width_in") or 0)
+                rh = float(row.get("height_in") or 0)
+            except (TypeError, ValueError):
+                return 9999.0
+            return abs(rw - tw) + abs(rh - th)
+
+        ranked = _pick_nearest_size_diverse_materials(
+            pool,
+            width_val=tw,
+            height_val=th,
+            limit=max(limit * 4, limit),
+        )
+        if mentioned_materials:
+            ranked = sorted(
+                ranked,
+                key=lambda r: (
+                    -_material_match_score(query_lower, str(r.get("material") or "")),
+                    _distance(r),
+                ),
+            )
+        return ranked[:limit]
+
+    ranked = sorted(
+        pool,
+        key=lambda r: -_material_match_score(query_lower, str(r.get("material") or "")),
+    )
+    return ranked[:limit]
+
+
 def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
     """
-    Smart pricing retrieval from fortis_pricing table.
-    Supports SKU lookup, material filtering, and quantity-based pricing.
+    Smart pricing retrieval from ``fortis_pricing``: SKU → material → size (+ nearest die) →
+    keywords → closest-match fallback over the catalog pool.
+
+    Each row may include ``_fortis_pricing_match``::
+
+        sku_exact | exact_size | closest_size | material_match | keyword_match |
+        closest_fallback | catalog_match
     """
     if not supabase or not query:
         return []
 
     query_lower = query.lower()
-    results: list[dict[str, Any]] = []
+    tol = _ROW_SIZE_TOL_IN
+    mentioned_materials = sorted({m for m in _MATERIAL_HINT_TERMS if m in query_lower})
 
-    # 1. Try exact SKU match first
+    # --- 1) SKU ---
     sku_match = re.search(r"(sticker_[a-z0-9.]+)", query_lower)
     if sku_match:
         sku = sku_match.group(1).upper()
         try:
             res = supabase.table("fortis_pricing").select("*").ilike("sku", f"%{sku}%").limit(1).execute()
             if res.data:
-                return res.data
+                return _annotate_pricing_rows(list(res.data)[:limit], query_lower, how="sku", tol=tol)
         except Exception:
             logger.warning("retrieve_pricing SKU lookup failed sku=%r", sku, exc_info=True)
 
-    # 2. Material-aware query path (substring + ILIKE on catalog material)
-    mentioned_materials = sorted({m for m in _MATERIAL_HINT_TERMS if m in query_lower})
+    # --- 2) Material ---
+    results: list[dict[str, Any]] = []
+    seen_ids: set[Any] = set()
+
+    def _take_material_row(row_raw: dict[str, Any]) -> bool:
+        row = dict(row_raw)
+        rid = row.get("id")
+        if rid in seen_ids:
+            return len(results) >= limit
+        seen_ids.add(rid)
+        results.append(row)
+        return len(results) >= limit
+
     for material in mentioned_materials[:3]:
         try:
             res = (
@@ -191,17 +327,16 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
             key=lambda r: (-_material_match_score(query_lower, str(r.get("material") or "")), str(r.get("sku"))),
         )
         for row in scored:
-            if row not in results:
-                results.append(row)
-                if len(results) >= limit:
-                    return results
+            if _take_material_row(row):
+                return _annotate_pricing_rows(results[:limit], query_lower, how="material", tol=tol)
 
-    # 3. Size-aware query path (e.g. "3x8"), with nearest-match fallback.
-    size_match = re.search(r"(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)", query_lower)
-    if size_match:
-        width_val = float(size_match.group(1))
-        height_val = float(size_match.group(2))
-        tol = 0.35  # tight tolerance in inches
+    if results:
+        return _annotate_pricing_rows(results[:limit], query_lower, how="material", tol=tol)
+
+    # --- 3) Size bucket + nearest-match (WxH × by) ---
+    size_tuple_pre = _extract_size_tuple(query_lower)
+    if size_tuple_pre:
+        width_val, height_val = size_tuple_pre
         try:
             tight = (
                 supabase.table("fortis_pricing")
@@ -242,7 +377,6 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
             height_val=height_val,
             limit=limit,
         )
-        # If user hinted material, prefer rows whose material text aligns (still size-ranked pool).
         if mentioned_materials:
             size_ranked = sorted(
                 size_ranked,
@@ -251,13 +385,13 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
                     _distance(r),
                 ),
             )
-        for row in size_ranked:
-            if row not in results:
-                results.append(row)
-                if len(results) >= limit:
-                    return results
+        sliced = [dict(r) for r in size_ranked[:limit]]
+        if sliced:
+            return _annotate_pricing_rows(sliced, query_lower, how="size", tol=tol)
 
-    # 4. Keyword search across material, description, notes
+    # --- 4) Keywords OR ---
+    results = []
+    seen_kw: set[Any] = set()
     keywords = [k for k in query_lower.split() if len(k) > 2]
     for keyword in keywords[:6]:
         term = _safe_ilike_term(keyword)
@@ -275,12 +409,23 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
             logger.warning("retrieve_pricing keyword OR failed term=%r", term, exc_info=True)
             continue
         for row in res.data or []:
-            if row not in results:
-                results.append(row)
-                if len(results) >= limit:
-                    return results
+            rid = row.get("id")
+            if rid in seen_kw:
+                continue
+            seen_kw.add(rid)
+            results.append(dict(row))
+            if len(results) >= limit:
+                return _annotate_pricing_rows(results[:limit], query_lower, how="keyword", tol=tol)
 
-    return results
+    if results:
+        return _annotate_pricing_rows(results[:limit], query_lower, how="keyword", tol=tol)
+
+    # --- 5) Whole-catalog closest match ---
+    fb = _closest_pricing_fallback(query_lower, limit)
+    if fb:
+        return _annotate_pricing_rows(fb, query_lower, how="fallback", tol=tol)
+
+    return []
 
 
 def _extract_quantity_from_query(query_lower: str) -> int | None:
@@ -303,7 +448,11 @@ def _extract_quantity_from_query(query_lower: str) -> int | None:
 
 
 def _extract_size_tuple(query_lower: str) -> tuple[float, float] | None:
-    m = re.search(r"(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)", query_lower)
+    m = re.search(
+        r"(\d+(?:\.\d+)?)\s*(?:x|×|\bby\b)\s*(\d+(?:\.\d+)?)",
+        query_lower,
+        re.IGNORECASE,
+    )
     if not m:
         return None
     return float(m.group(1)), float(m.group(2))
@@ -341,16 +490,14 @@ def _mentioned_qty_tiers(query_lower: str) -> list[int]:
     return found
 
 
-def _exact_row_for_size(rows: list[dict[str, Any]], tw: float, th: float, eps: float = 0.0001) -> bool:
-    for row in rows:
-        try:
-            w = float(row.get("width_in") or 0)
-            h = float(row.get("height_in") or 0)
-        except (TypeError, ValueError):
-            continue
-        if abs(w - tw) <= eps and abs(h - th) <= eps:
-            return True
-    return False
+def _exact_row_for_size(
+    rows: list[dict[str, Any]],
+    tw: float,
+    th: float,
+    *,
+    tol: float = _ROW_SIZE_TOL_IN,
+) -> bool:
+    return any(_row_matches_size_tolerance(r, tw, th, tol) for r in rows)
 
 
 def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
@@ -382,6 +529,9 @@ def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
 
     tier_qtys = _mentioned_qty_tiers(query_lower)
 
+    match_hints = [str(row.get("_fortis_pricing_match") or "") for row in rows[:5]]
+    is_closest_catalog = any(h in ("closest_size", "closest_fallback") for h in match_hints)
+
     lines: list[str] = []
     for row in rows[:5]:
         sku = row.get("sku") or "Unknown SKU"
@@ -390,9 +540,15 @@ def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
         finish = row.get("finish") or "N/A"
         selected_cost = row.get(qty_key)
         cost_label = qty_key.replace("cost_", "").upper()
+        tag = row.get("_fortis_pricing_match")
+        tag_note = (
+            f" | (nearest catalog match: {tag})"
+            if tag in ("closest_size", "closest_fallback")
+            else ""
+        )
         lines.append(
             f"- {sku} | {description} | Material: {material} | Finish: {finish} | "
-            f"Cost@{cost_label}: {selected_cost}"
+            f"Cost@{cost_label}: {selected_cost}{tag_note}"
         )
 
     distinct_materials: list[str] = []
@@ -406,10 +562,16 @@ def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
             seen_m.add(key)
             distinct_materials.append(m)
 
-    parts = [
-        "Pricing Agent Context (Quick Ship labels / fortis_pricing ONLY — not pouches, shipper boxes, or unrelated packaging):",
-        "\n".join(lines),
-    ]
+    header = (
+        "Pricing Agent Context (Quick Ship labels / fortis_pricing ONLY — not pouches, shipper boxes, or unrelated packaging):"
+    )
+    if is_closest_catalog:
+        header += (
+            "\nNearest-match note: No exact SKU/product match was found for the request as stated. Recommend the closest "
+            "rows below explicitly; confirm material, finish, and dimensions with the customer before locking a quote."
+        )
+
+    parts = [header, "\n".join(lines)]
 
     if size_tuple:
         tw, th = size_tuple
