@@ -19,7 +19,7 @@ from fortis_cs_agent.knowledge import retrieve_pricing
 logger = logging.getLogger(__name__)
 
 # Bumped when changing estimate wizard behavior; exposed on GET /health for deploy verification.
-ESTIMATE_FLOW_BUILD = "wizard-v1"
+ESTIMATE_FLOW_BUILD = "wizard-v2-pricing-health"
 
 _STEPS = ("product_details", "business_name", "contact_name", "email", "address")
 _DEFAULT_NOTES = "This quote does not include shipping or taxes. Prices are valid for 30 days."
@@ -149,8 +149,11 @@ def _persist_structured_estimate(
     pricing_rows = retrieve_pricing(str(blob), limit=5)
     if not pricing_rows:
         return (
-            "Everything’s captured, but the catalog lookup returned no rows yet. Reply again with qty + "
-            "**exact WxH inches** + material/finish so we can latch a SKU.",
+            "Everything’s captured, but the catalog lookup returned no rows yet.\n\n"
+            "• Send one line again: **qty, WxH inches, material/finish/colors**\n\n"
+            "If this keeps happening, call **GET /health** on the API and check **pricing_health** — "
+            "`has_rows` should be true. If it is false, the Quick Ship pricing table is empty, the table name "
+            "does not match (set env **FORTIS_PRICING_TABLE**), or this deploy’s Supabase key cannot read that table.",
             None,
         )
 

@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 from typing import Any, Dict, List
 
@@ -6,6 +7,31 @@ from typing import Any, Dict, List
 from fortis_cs_agent.store import supabase
 
 logger = logging.getLogger(__name__)
+
+
+def _fortis_pricing_table() -> str:
+    name = (os.getenv("FORTIS_PRICING_TABLE") or "fortis_pricing").strip()
+    return name if name else "fortis_pricing"
+
+
+def pricing_health_probe() -> dict[str, Any]:
+    """Lightweight Supabase sanity check for operations (expose on /health)."""
+    table = _fortis_pricing_table()
+    out: dict[str, Any] = {"table": table, "supabase": supabase is not None}
+    if not supabase:
+        out["ok"] = False
+        out["error"] = "supabase_disabled"
+        return out
+    try:
+        res = supabase.table(table).select("*").limit(1).execute()
+        out["ok"] = True
+        out["has_rows"] = bool(res.data)
+    except Exception as exc:
+        out["ok"] = False
+        out["error"] = type(exc).__name__
+        out["error_detail"] = str(exc)[:400]
+        logger.warning("pricing_health_probe failed table=%s", table, exc_info=True)
+    return out
 
 
 def _safe_ilike_term(raw: str) -> str | None:
@@ -56,6 +82,24 @@ def retrieve_knowledge(query: str, limit: int = 5) -> List[Dict]:
 
 # Pricing table text column (Postgres / Supabase schema uses comment_application).
 _FORTIS_PRICING_COMMENT_COL = "comment_application"
+
+
+def _pricing_dedupe_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    """Stable tuple for deduping REST rows — handles missing UUID ``id`` or duplicate null ids."""
+    rid = row.get("id")
+    if rid is not None:
+        return ("id", rid)
+    sku = str(row.get("sku") or "").strip().lower()
+    if sku:
+        return ("sku", sku)
+    return (
+        "hash",
+        str(row.get("width_in")),
+        str(row.get("height_in")),
+        str(row.get("material") or "")[:80],
+        str(row.get(_FORTIS_PRICING_COMMENT_COL) or row.get("description") or "")[:120],
+        str(row.get("finish") or "")[:80],
+    )
 
 
 _MATERIAL_HINT_TERMS = frozenset(
@@ -195,44 +239,74 @@ def _annotate_pricing_rows(
     return [{**dict(r), "_fortis_pricing_match": _match_tag(r)} for r in rows]
 
 
-def _closest_pricing_fallback(query_lower: str, limit: int) -> list[dict[str, Any]]:
-    """When targeted paths yield nothing — broad fetch + nearest size/material scoring."""
+def _execute_pricing_keyword_or(term: str, limit: int) -> Any:
+    """Run keyword OR against fortis_pricing with broadening filters if columns differ by env."""
+    c = _FORTIS_PRICING_COMMENT_COL
+    tbl = _fortis_pricing_table()
+    clauses = (
+        f"{c}.ilike.%{term}%,material.ilike.%{term}%,finish.ilike.%{term}%,notes.ilike.%{term}%",
+        f"{c}.ilike.%{term}%,material.ilike.%{term}%,finish.ilike.%{term}%",
+        f"{c}.ilike.%{term}%,material.ilike.%{term}%",
+        f"{c}.ilike.%{term}%",
+        f"material.ilike.%{term}%",
+    )
+    if not supabase:
+        return None
+    for filt in clauses:
+        try:
+            return supabase.table(tbl).select("*").or_(filt).limit(limit).execute()
+        except Exception:
+            logger.debug("pricing keyword clause failed tbl=%s filter=%r", tbl, filt[:120], exc_info=True)
+            continue
+    return None
 
+
+def _closest_pricing_fallback(query_lower: str, limit: int) -> list[dict[str, Any]]:
+    """When targeted paths yield nothing — load a slab of the pricing table and rank."""
     if not supabase:
         return []
 
+    tbl = _fortis_pricing_table()
     mentioned_materials = sorted({m for m in _MATERIAL_HINT_TERMS if m in query_lower})
     size_tuple = _extract_size_tuple(query_lower)
     pool: list[dict[str, Any]] = []
-    seen: set[Any] = set()
+    seen: set[tuple[Any, ...]] = set()
+
+    def _add(rows: list[dict[str, Any]]) -> None:
+        for row in rows:
+            r = dict(row)
+            key = _pricing_dedupe_key(r)
+            if key in seen:
+                continue
+            seen.add(key)
+            pool.append(r)
 
     try:
+        base = (
+            supabase.table(tbl).select("*").limit(max(400, limit * 80)).execute()
+        )
+        _add(list(base.data or []))
         for material in mentioned_materials[:3]:
-            res = (
-                supabase.table("fortis_pricing")
-                .select("*")
-                .ilike("material", f"%{material}%")
-                .limit(120)
-                .execute()
-            )
-            for row in res.data or []:
-                rid = row.get("id")
-                if rid not in seen:
-                    seen.add(rid)
-                    pool.append(dict(row))
-
-        if len(pool) < max(limit * 2, 16):
-            extra = supabase.table("fortis_pricing").select("*").limit(220).execute()
-            for row in extra.data or []:
-                rid = row.get("id")
-                if rid not in seen:
-                    seen.add(rid)
-                    pool.append(dict(row))
+            try:
+                res_mat = (
+                    supabase.table(tbl)
+                    .select("*")
+                    .ilike("material", f"%{material}%")
+                    .limit(120)
+                    .execute()
+                )
+                _add(list(res_mat.data or []))
+            except Exception:
+                logger.debug("fallback material subset failed material=%r", material, exc_info=True)
     except Exception:
-        logger.warning("_closest_pricing_fallback fetch failed", exc_info=True)
+        logger.warning("_closest_pricing_fallback fetch failed tbl=%s", tbl, exc_info=True)
         return []
 
     if not pool:
+        logger.warning(
+            "retrieve_pricing: table %s returned zero rows (empty table, wrong table name, or deny policy).",
+            tbl,
+        )
         return []
 
     if size_tuple:
@@ -283,6 +357,7 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
         return []
 
     query_lower = query.lower()
+    tbl = _fortis_pricing_table()
     tol = _ROW_SIZE_TOL_IN
     mentioned_materials = sorted({m for m in _MATERIAL_HINT_TERMS if m in query_lower})
 
@@ -291,7 +366,7 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
     if sku_match:
         sku = sku_match.group(1).upper()
         try:
-            res = supabase.table("fortis_pricing").select("*").ilike("sku", f"%{sku}%").limit(1).execute()
+            res = supabase.table(tbl).select("*").ilike("sku", f"%{sku}%").limit(1).execute()
             if res.data:
                 return _annotate_pricing_rows(list(res.data)[:limit], query_lower, how="sku", tol=tol)
         except Exception:
@@ -299,21 +374,21 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
 
     # --- 2) Material ---
     results: list[dict[str, Any]] = []
-    seen_ids: set[Any] = set()
+    seen_mat: set[tuple[Any, ...]] = set()
 
     def _take_material_row(row_raw: dict[str, Any]) -> bool:
         row = dict(row_raw)
-        rid = row.get("id")
-        if rid in seen_ids:
+        dk = _pricing_dedupe_key(row)
+        if dk in seen_mat:
             return len(results) >= limit
-        seen_ids.add(rid)
+        seen_mat.add(dk)
         results.append(row)
         return len(results) >= limit
 
     for material in mentioned_materials[:3]:
         try:
             res = (
-                supabase.table("fortis_pricing")
+                supabase.table(tbl)
                 .select("*")
                 .ilike("material", f"%{material}%")
                 .limit(max(limit * 2, 8))
@@ -339,7 +414,7 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
         width_val, height_val = size_tuple_pre
         try:
             tight = (
-                supabase.table("fortis_pricing")
+                supabase.table(tbl)
                 .select("*")
                 .gte("width_in", width_val - tol)
                 .lte("width_in", width_val + tol)
@@ -350,14 +425,14 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
             )
             candidates = list(tight.data or [])
             if not candidates:
-                broad = supabase.table("fortis_pricing").select("*").limit(150).execute()
+                broad = supabase.table(tbl).select("*").limit(150).execute()
                 candidates = list(broad.data or [])
         except Exception:
             logger.warning("retrieve_pricing size-bucket query failed", exc_info=True)
             candidates = []
         if not candidates:
             try:
-                broad = supabase.table("fortis_pricing").select("*").limit(150).execute()
+                broad = supabase.table(tbl).select("*").limit(150).execute()
                 candidates = list(broad.data or [])
             except Exception:
                 logger.warning("retrieve_pricing broad fetch failed", exc_info=True)
@@ -391,49 +466,25 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
 
     # --- 4) Keywords OR ---
     results = []
-    seen_kw: set[Any] = set()
+    seen_kw: set[tuple[Any, ...]] = set()
     keywords = [k for k in query_lower.split() if len(k) > 2]
     for keyword in keywords[:6]:
         term = _safe_ilike_term(keyword)
         if not term:
             continue
-        try:
-            res = (
-                supabase.table("fortis_pricing")
-                .select("*")
-                .or_(
-                    f"{_FORTIS_PRICING_COMMENT_COL}.ilike.%{term}%,material.ilike.%{term}%,"
-                    f"finish.ilike.%{term}%,notes.ilike.%{term}%"
-                )
-                .limit(limit)
-                .execute()
-            )
-        except Exception:
+        res_kw = _execute_pricing_keyword_or(term, limit)
+        if res_kw is None:
             logger.warning(
-                "retrieve_pricing keyword OR (with notes) failed term=%r; retrying without notes",
-                term,
-                exc_info=True,
+                "retrieve_pricing keyword OR exhausted all clauses term=%r table=%s", term, tbl
             )
-            try:
-                res = (
-                    supabase.table("fortis_pricing")
-                    .select("*")
-                    .or_(
-                        f"{_FORTIS_PRICING_COMMENT_COL}.ilike.%{term}%,material.ilike.%{term}%,"
-                        f"finish.ilike.%{term}%"
-                    )
-                    .limit(limit)
-                    .execute()
-                )
-            except Exception:
-                logger.warning("retrieve_pricing keyword OR failed term=%r", term, exc_info=True)
+            continue
+        for row in res_kw.data or []:
+            r = dict(row)
+            dk = _pricing_dedupe_key(r)
+            if dk in seen_kw:
                 continue
-        for row in res.data or []:
-            rid = row.get("id")
-            if rid in seen_kw:
-                continue
-            seen_kw.add(rid)
-            results.append(dict(row))
+            seen_kw.add(dk)
+            results.append(r)
             if len(results) >= limit:
                 return _annotate_pricing_rows(results[:limit], query_lower, how="keyword", tol=tol)
 
@@ -445,6 +496,11 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
     if fb:
         return _annotate_pricing_rows(fb, query_lower, how="fallback", tol=tol)
 
+    logger.warning(
+        "retrieve_pricing returned no rows (table=%r query_prefix=%r). Check GET /health field pricing_health.",
+        tbl,
+        query.strip()[:120],
+    )
     return []
 
 

@@ -27,7 +27,7 @@ from fortis_cs_agent.estimate_detector import is_estimate_request
 
 # Bind estimate_flow only via _estimate_flow (avoid a second import from the estimate_flow submodule).
 from fortis_cs_agent import estimate_flow as _estimate_flow
-from fortis_cs_agent.knowledge import format_pricing_context, retrieve_knowledge, retrieve_pricing
+from fortis_cs_agent.knowledge import format_pricing_context, pricing_health_probe, retrieve_knowledge, retrieve_pricing
 from fortis_cs_agent.prompts import render_system_prompt
 from fortis_cs_agent.store import load_estimate_snapshot
 from fortis_cs_agent.tools import AGENT_TOOLS, assemble_estimate_result, create_estimate, execute_agent_tool
@@ -600,6 +600,7 @@ async def health() -> dict[str, Any]:
         "grok_configured": bool(XAI_API_KEY),
         "grok_model": XAI_CHAT_MODEL,
         "supabase_configured": supabase is not None,
+        "pricing_health": pricing_health_probe(),
         "estimate_flow_build": _estimate_flow.ESTIMATE_FLOW_BUILD,
         "vercel_git_commit_sha": (os.getenv("VERCEL_GIT_COMMIT_SHA") or "").strip() or None,
         "vercel_git_commit_ref": (os.getenv("VERCEL_GIT_COMMIT_REF") or "").strip() or None,
