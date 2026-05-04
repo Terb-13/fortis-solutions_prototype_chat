@@ -137,7 +137,7 @@ Configure the Twilio number’s **A Message Comes In** webhook to `POST https://
 
 ## Deploy (Vercel)
 
-`vercel.json` routes requests to FastAPI (`main.py`): `framework` is unset so Next in this repo does not hijack deploy, **`installCommand`** installs Python deps, **`buildCommand`** ensures a **`public/`** directory exists, and **`outputDirectory`** is **`public`** so Vercel’s static output check passes (all HTTP still hits `main.py` via the catch‑all route). Set environment variables in the Vercel project. For Twilio signature validation, use the **public** HTTPS URL Twilio calls.
+`vercel.json` uses the **`@vercel/python`** build for root `main.py` and routes all traffic there (see `requirements.txt` for deps). Set environment variables in the Vercel project. For Twilio signature validation, use the **public** HTTPS URL Twilio calls.
 
 ## Project layout
 

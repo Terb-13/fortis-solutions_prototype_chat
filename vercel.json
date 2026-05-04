@@ -1,10 +1,11 @@
 {
-  "$schema": "https://openapi.vercel.sh/vercel.json",
   "version": 2,
-  "framework": null,
-  "installCommand": "pip install -r requirements.txt",
-  "buildCommand": "echo skip-static-build",
-  "outputDirectory": "public",
+  "builds": [
+    {
+      "src": "main.py",
+      "use": "@vercel/python"
+    }
+  ],
   "routes": [
     {
       "src": "/(.*)",
