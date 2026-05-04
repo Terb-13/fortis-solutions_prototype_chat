@@ -519,7 +519,8 @@ def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
         )
 
     parts.append(
-        "Formal PDF: When user gives contact name + company name + email, call create_estimate and paste pdf_link from the tool result."
+        "Formal PDF: When user gives contact name + company name + email, call generate_estimate_pdf and paste pdf_link from the tool result. "
+        "Saved SKU quote: When they want a formal structured quote record with line items, call create_estimate (conversation_id is filled server-side)."
     )
     parts.append(
         "Guided follow-up: One question only when possible; labels only — never pivot to pouches/corrugated unless the user asks."

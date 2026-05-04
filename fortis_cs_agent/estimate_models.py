@@ -173,7 +173,7 @@ class CreateEstimateResult(BaseModel):
 
 
 class EstimateProductLineInput(BaseModel):
-    """One line as passed from the create_estimate tool (LLM-friendly)."""
+    """One line as passed from the generate_estimate_pdf tool (LLM-friendly)."""
 
     product_type: ProductType
     quantity: int = Field(..., ge=1, le=50_000_000)
@@ -208,7 +208,7 @@ class EstimateProductLineInput(BaseModel):
 
 class CreateEstimateToolPayload(BaseModel):
     """
-    Modern create_estimate tool payload (customer_name + products[]).
+    Payload for the Grok tool generate_estimate_pdf (customer_name + products[]).
 
     Legacy REST/chat may still send { customer, line_items, turnaround }.
     """

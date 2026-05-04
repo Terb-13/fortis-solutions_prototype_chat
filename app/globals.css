@@ -1,0 +1,33 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-stone-100 text-stone-900 antialiased;
+  }
+}
+
+@layer utilities {
+  .quote-sheet {
+    @apply mx-auto max-w-4xl rounded-lg border border-stone-200 bg-white shadow-sm;
+  }
+
+  @media print {
+    body {
+      @apply bg-white;
+    }
+    .quote-no-print {
+      display: none !important;
+    }
+    .quote-sheet {
+      max-width: none;
+      border-radius: 0;
+      border: none;
+      box-shadow: none;
+    }
+    .quote-break-inside-avoid {
+      break-inside: avoid;
+    }
+  }
+}

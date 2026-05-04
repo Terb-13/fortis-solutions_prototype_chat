@@ -20,13 +20,192 @@ from fortis_cs_agent.estimate_models import (
     normalize_estimate_payload,
 )
 from fortis_cs_agent.estimate_pdf import build_estimate_pdf_bytes, pdf_to_base64
-from fortis_cs_agent.store import save_estimate_snapshot
+from fortis_cs_agent.store import EST_TABLE, save_estimate_snapshot, supabase as _supabase_client
 
 logger = logging.getLogger(__name__)
 
 
+def insert_fortis_estimate(
+    conversation_id: str,
+    business_name: str,
+    contact_name: str,
+    email: str,
+    phone: str,
+    address: str,
+    items: list[dict],
+    notes: str = "This quote does not include shipping or taxes. Prices are valid for 30 days.",
+) -> dict:
+    """
+    Insert a structured estimate row into Supabase (`fortis_estimates` by default).
+
+    Requires a table schema that supports these columns (expand DDL if you currently only store JSON snapshots).
+
+    items should be a list of dicts like:
+    [
+        {"sku": "STICKER_3x8_WBGP_G", "description": "3x8 White BOPP Gloss", "quantity": 5000, "unit_price": 0.0839, "total": 419.5},
+        ...
+    ]
+    """
+    if _supabase_client is None:
+        raise RuntimeError(
+            "Supabase is not configured; set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY to insert estimates."
+        )
+
+    subtotal = sum(item.get("total", 0) for item in items)
+
+    data = {
+        "conversation_id": conversation_id,
+        "business_name": business_name,
+        "contact_name": contact_name,
+        "email": email,
+        "phone": phone,
+        "address": address,
+        "items": items,
+        "subtotal": subtotal,
+        "notes": notes,
+        "status": "draft",
+    }
+
+    result = _supabase_client.table(EST_TABLE).insert(data).execute()
+    if not result.data:
+        raise RuntimeError("Supabase insert returned no rows; check table schema and RLS policies.")
+    estimate_id = result.data[0]["id"]
+
+    return {
+        "estimate_id": estimate_id,
+        "message": f"Estimate created successfully. Share this link with the customer: /quote/{estimate_id}",
+    }
+
+
+def _structured_estimate_validation_failed(
+    hint: str,
+    *,
+    details: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {"error": "validation_failed", "hint": hint, "details": details or []}
+
+
+def _coerce_positive_number(value: Any, *, field: str) -> tuple[float | None, str | None]:
+    if value is None:
+        return None, field
+    if isinstance(value, bool):
+        return None, field
+    if isinstance(value, (int, float)):
+        if value < 0:
+            return None, field
+        return float(value), None
+    if isinstance(value, str) and value.strip():
+        try:
+            n = float(value.strip().replace(",", ""))
+            if n < 0:
+                return None, field
+            return n, None
+        except ValueError:
+            return None, field
+    return None, field
+
+
+def _parse_structured_create_estimate_args(
+    raw: dict[str, Any],
+    *,
+    conversation_id: str | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Returns (kwargs for insert_fortis_estimate, error_response)."""
+    cid = (conversation_id or "").strip() or str(raw.get("conversation_id") or "").strip()
+    if not cid:
+        return None, _structured_estimate_validation_failed(
+            "conversation_id is missing; the server should attach the active thread id—retry once."
+        )
+
+    business_name = str(raw.get("business_name") or "").strip()
+    contact_name = str(raw.get("contact_name") or "").strip()
+    email = str(raw.get("email") or "").strip()
+    phone = str(raw.get("phone") or "").strip()
+    address = str(raw.get("address") or "").strip()
+    notes_raw = raw.get("notes")
+    notes = (
+        "This quote does not include shipping or taxes. Prices are valid for 30 days."
+        if notes_raw is None
+        else str(notes_raw).strip()
+    )
+
+    missing = [
+        label
+        for label, ok in (
+            ("business_name", bool(business_name)),
+            ("contact_name", bool(contact_name)),
+            ("email", bool(email)),
+        )
+        if not ok
+    ]
+    if missing:
+        return None, _structured_estimate_validation_failed(
+            "Required fields missing or empty.",
+            details=[{"field": m, "message": "required non-empty string"} for m in missing],
+        )
+
+    items_raw = raw.get("items")
+    if not isinstance(items_raw, list) or len(items_raw) < 1:
+        return None, _structured_estimate_validation_failed(
+            "items must be a non-empty array of line objects.",
+            details=[{"field": "items", "message": "expected at least one line"}],
+        )
+
+    normalized_items: list[dict[str, Any]] = []
+    for idx, row in enumerate(items_raw):
+        if not isinstance(row, dict):
+            return None, _structured_estimate_validation_failed(
+                f"items[{idx}] must be an object.",
+                details=[{"field": f"items[{idx}]", "message": "invalid line"}],
+            )
+        sku = str(row.get("sku") or "").strip()
+        description = str(row.get("description") or "").strip()
+        qty, qerr = _coerce_positive_number(row.get("quantity"), field="quantity")
+        unit_price, uperr = _coerce_positive_number(row.get("unit_price"), field="unit_price")
+        total, terr = _coerce_positive_number(row.get("total"), field="total")
+        line_issues = []
+        if not sku:
+            line_issues.append("sku")
+        if not description:
+            line_issues.append("description")
+        if qerr or qty is None or qty <= 0:
+            line_issues.append("quantity")
+        if uperr or unit_price is None:
+            line_issues.append("unit_price")
+        if terr or total is None:
+            line_issues.append("total")
+        if line_issues:
+            return None, _structured_estimate_validation_failed(
+                f"Invalid line items[{idx}]: check sku, description, quantity, unit_price, total.",
+                details=[{"field": f"items[{idx}]", "message": ", ".join(line_issues)}],
+            )
+        normalized_items.append(
+            {
+                "sku": sku,
+                "description": description,
+                "quantity": qty,
+                "unit_price": unit_price,
+                "total": total,
+            }
+        )
+
+    return (
+        {
+            "conversation_id": cid,
+            "business_name": business_name,
+            "contact_name": contact_name,
+            "email": email,
+            "phone": phone,
+            "address": address,
+            "items": normalized_items,
+            "notes": notes or "This quote does not include shipping or taxes. Prices are valid for 30 days.",
+        },
+        None,
+    )
+
+
 def _tool_validation_error_payload(exc: ValidationError) -> dict[str, Any]:
-    """Structured, model-friendly errors when create_estimate payload is wrong."""
+    """Structured, model-friendly errors when generate_estimate_pdf payload is wrong."""
     items = []
     for err in exc.errors()[:12]:
         loc = [str(x) for x in err.get("loc", ())]
@@ -41,19 +220,21 @@ def _tool_validation_error_payload(exc: ValidationError) -> dict[str, Any]:
 
 # --- OpenAI-compatible tool schemas ----------------------------------------------------
 
-CREATE_ESTIMATE_TOOL: dict[str, Any] = {
+GENERATE_ESTIMATE_PDF_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
-        "name": "create_estimate",
+        "name": "generate_estimate_pdf",
         "description": (
-            "Generate a Fortis Edge indicative estimate PDF link + totals. "
+            "Generate a Fortis Edge indicative estimate PDF link + totals (downloadable PDF workflow). "
+            "Use when the customer wants a formal PDF quote / indicative packaging estimate. "
             "Call as soon as you have: customer_name (contact person), company (business name — ask if missing), "
             "email (required for routing), product_type (usually pressure_sensitive_labels for Quick Ship labels), "
             "quantity, width/height in inches when known (use catalog nearest match from pricing context if needed), "
             "material/finish, colors (e.g. CMYK). "
             "After calling: include the tool's pdf_link verbatim in your reply so the user can open the PDF. "
             "Do not invent alternate URLs. "
-            "If PUBLIC_BASE_URL is unset server-side, pdf_link may be a relative path — still pass it through."
+            "If PUBLIC_BASE_URL is unset server-side, pdf_link may be a relative path — still pass it through. "
+            "For saving a line-item quote with SKU-level pricing to the database instead, use create_estimate."
         ),
         "parameters": {
             "type": "object",
@@ -117,6 +298,56 @@ CREATE_ESTIMATE_TOOL: dict[str, Any] = {
 }
 
 
+CREATE_ESTIMATE_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "create_estimate",
+        "description": (
+            "Save a formal structured estimate / quote to Fortis (Supabase) with SKU line items and computed totals. "
+            "Use when the customer wants an official saved quote, a record they can share via link, or line-level SKU pricing "
+            "grounded in catalog/pricing context (not the PDF generator). "
+            "Collect business details and build items[] from confirmed SKUs, descriptions, quantities, unit_price, and line totals. "
+            "conversation_id is normally injected by the server from the active chat thread—you may omit it or leave it empty."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "conversation_id": {
+                    "type": "string",
+                    "description": "Active chat thread id; server fills this automatically when omitted.",
+                },
+                "business_name": {"type": "string", "description": "Customer company / organization"},
+                "contact_name": {"type": "string", "description": "Primary contact full name"},
+                "email": {"type": "string", "description": "Contact email for the quote"},
+                "phone": {"type": "string", "description": "Phone (optional; use empty string if unknown)"},
+                "address": {"type": "string", "description": "Ship-to or billing address (optional; use empty string if unknown)"},
+                "items": {
+                    "type": "array",
+                    "minItems": 1,
+                    "description": "Quote lines with SKU-level pricing from catalog context",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "sku": {"type": "string"},
+                            "description": {"type": "string"},
+                            "quantity": {"type": "number"},
+                            "unit_price": {"type": "number"},
+                            "total": {"type": "number"},
+                        },
+                        "required": ["sku", "description", "quantity", "unit_price", "total"],
+                    },
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Customer-visible notes (defaults server-side if omitted)",
+                },
+            },
+            "required": ["business_name", "contact_name", "email", "items"],
+        },
+    },
+}
+
+
 GET_PORTAL_STATUS_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
@@ -157,7 +388,7 @@ SEARCH_PRODUCTS_TOOL: dict[str, Any] = {
         "name": "search_products",
         "description": (
             "Suggest product_type enum values from natural language (e.g. wrap labels, RFID tags, e-com shipper). "
-            "Always call before create_estimate when category is ambiguous."
+            "Always call before generate_estimate_pdf when category is ambiguous."
         ),
         "parameters": {
             "type": "object",
@@ -174,6 +405,7 @@ SEARCH_PRODUCTS_TOOL: dict[str, Any] = {
 
 
 AGENT_TOOLS: list[dict[str, Any]] = [
+    GENERATE_ESTIMATE_PDF_TOOL,
     CREATE_ESTIMATE_TOOL,
     GET_PORTAL_STATUS_TOOL,
     GET_SBU_METRICS_TOOL,
@@ -444,7 +676,7 @@ def search_products(*, query: str, limit: int = 5) -> dict[str, Any]:
     return {
         "query": query,
         "matches": top,
-        "hint": "Pick product_type from matches and pass to create_estimate.",
+        "hint": "Pick product_type from matches and pass to generate_estimate_pdf.",
     }
 
 
@@ -492,14 +724,20 @@ def execute_agent_tool(
     raw_args: dict[str, Any],
     *,
     persist_estimate: bool = True,
+    conversation_id: str | None = None,
 ) -> dict[str, Any]:
     """Dispatch tool by name; always returns a JSON-serializable dict (for Grok)."""
     fn = (function_name or "").strip()
     args = raw_args or {}
-    logger.debug("execute_agent_tool name=%s persist_estimate=%s", fn, persist_estimate)
+    logger.debug(
+        "execute_agent_tool name=%s persist_estimate=%s conversation_id=%s",
+        fn,
+        persist_estimate,
+        conversation_id,
+    )
 
     try:
-        if fn == "create_estimate":
+        if fn == "generate_estimate_pdf":
             try:
                 result = create_estimate(
                     payload=args,
@@ -509,6 +747,56 @@ def execute_agent_tool(
                 return result.to_tool_dict()
             except ValidationError as exc:
                 return _tool_validation_error_payload(exc)
+
+        if fn == "create_estimate":
+            products = args.get("products")
+            if isinstance(products, list) and len(products) > 0 and args.get("customer_name"):
+                # Back-compat: older prompts named the PDF tool `create_estimate`.
+                try:
+                    result = create_estimate(
+                        payload=args,
+                        include_pdf_base64=False,
+                        persist_snapshot=persist_estimate,
+                    )
+                    return result.to_tool_dict()
+                except ValidationError as exc:
+                    return _tool_validation_error_payload(exc)
+
+            kwargs, err = _parse_structured_create_estimate_args(args, conversation_id=conversation_id)
+            if err:
+                return err
+            assert kwargs is not None
+            subtotal = sum(float(item.get("total", 0)) for item in kwargs["items"])
+            if not persist_estimate:
+                logger.info(
+                    "create_estimate structured dry_run conversation_id=%s lines=%s subtotal=%s",
+                    kwargs["conversation_id"],
+                    len(kwargs["items"]),
+                    subtotal,
+                )
+                return {
+                    "dry_run": True,
+                    "conversation_id": kwargs["conversation_id"],
+                    "subtotal": subtotal,
+                    "items": kwargs["items"],
+                    "message": (
+                        "Test mode: structured estimate was not saved. "
+                        "In production this would create a database record and return estimate_id + customer link."
+                    ),
+                }
+            try:
+                out = insert_fortis_estimate(**kwargs)
+                logger.info(
+                    "create_estimate structured ok estimate_id=%s conversation_id=%s",
+                    out.get("estimate_id"),
+                    kwargs["conversation_id"],
+                )
+                return out
+            except RuntimeError as exc:
+                return {"error": "configuration_error", "message": str(exc)[:600]}
+            except Exception as exc:
+                logger.exception("create_estimate structured insert failed.")
+                return {"error": "tool_failed", "message": str(exc)[:600]}
 
         if fn == "get_portal_status":
             return get_portal_status()

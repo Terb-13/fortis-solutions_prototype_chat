@@ -314,7 +314,8 @@ async def run_agent_turn(
             knowledge_context = (
                 "Quick Ship label pricing: No fortis_pricing rows matched this thread yet. "
                 "Stay on pressure-sensitive labels; do not cite pouch / flexible film / PET laminate examples or unrelated internal stories as pricing. "
-                "Collect company name, contact name, email, size, qty, material/finish; then call create_estimate for pdf_link."
+                "Collect company name, contact name, email, size, qty, material/finish; then call generate_estimate_pdf for pdf_link, "
+                "or create_estimate when they want a saved SKU-level quote record."
             )
         else:
             try:
@@ -365,7 +366,12 @@ async def run_agent_turn(
                     logger.warning("tool_call_invalid_json tool=%s raw=%s", fname, args_raw[:200])
                     args = {}
 
-                payload = execute_agent_tool(fname or "", args, persist_estimate=True)
+                payload = execute_agent_tool(
+                    fname or "",
+                    args,
+                    persist_estimate=True,
+                    conversation_id=conversation_id,
+                )
                 try:
                     tool_body = json.dumps(payload, default=str)
                 except Exception:
@@ -498,7 +504,12 @@ async def test_chat(
                 except json.JSONDecodeError:
                     logger.warning("test_chat bad_tool_json tool=%s", fname)
                     args = {}
-                payload = execute_agent_tool(fname or "", args, persist_estimate=False)
+                payload = execute_agent_tool(
+                    fname or "",
+                    args,
+                    persist_estimate=False,
+                    conversation_id=cid,
+                )
                 grok_msgs.append(
                     {
                         "role": "tool",
