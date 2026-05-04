@@ -1,0 +1,2 @@
+# Local dev / GitHub Actions (not required at runtime)
+pytest>=8.0.0,<10
