@@ -22,7 +22,7 @@ from twilio.twiml.messaging_response import MessagingResponse
 from fortis_cs_agent.estimate_models import EstimateRequest
 from fortis_cs_agent.estimate_pdf import write_estimate_pdf_binary
 from fortis_cs_agent.knowledge import format_pricing_context, retrieve_knowledge, retrieve_pricing
-from fortis_cs_agent.prompts import SYSTEM_PROMPT
+from fortis_cs_agent.prompts import render_system_prompt
 from fortis_cs_agent.store import load_estimate_snapshot
 from fortis_cs_agent.tools import AGENT_TOOLS, assemble_estimate_result, create_estimate, execute_agent_tool
 
@@ -65,32 +65,73 @@ def _sb() -> Any:
     return supabase
 
 
+def _normalize_conversation_id(existing_id: str | None) -> str:
+    """Return a UUID string for this thread: reuse client id when valid, else allocate new."""
+    raw = (existing_id or "").strip()
+    if not raw:
+        return str(uuid.uuid4())
+    try:
+        uuid.UUID(raw)
+        return raw
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid conversation_id from client %r; allocating a new UUID.",
+            raw[:80],
+        )
+        return str(uuid.uuid4())
+
+
 def ensure_conversation(
     *,
     channel: Literal["sms", "web", "api"],
     channel_ref: str | None,
     existing_id: str | None,
 ) -> str | None:
-    """Create or reuse a conversation row; returns UUID string or None when DB unavailable."""
+    """Ensure a row exists in ``fortis_conversations`` for the returned id.
+
+    When Supabase is configured, **always upserts** (including when the client sends an
+    ``existing_id``) so ``fortis_messages`` foreign keys succeed.
+
+    Returns:
+        - UUID string when persistence is skipped (no Supabase client) or upsert succeeds.
+        - ``None`` only when Supabase is configured but upsert fails (caller should treat as fatal for DB-backed chat).
+    """
+    conv_id = _normalize_conversation_id(existing_id)
     client = _sb()
     if client is None:
-        return existing_id or str(uuid.uuid4())
+        return conv_id
 
-    conv_id = existing_id or str(uuid.uuid4())
+    row = {
+        "id": conv_id,
+        "channel": channel,
+        "channel_ref": channel_ref or "",
+    }
     try:
-        if existing_id:
-            return existing_id
-
-        row = {
-            "id": conv_id,
-            "channel": channel,
-            "channel_ref": channel_ref or "",
-        }
-        client.table(CONV_TABLE).upsert(row).execute()
+        response = client.table(CONV_TABLE).upsert(row).execute()
+        logger.info(
+            "ensure_conversation upsert ok table=%s conversation_id=%s channel=%s channel_ref=%r rows=%s",
+            CONV_TABLE,
+            conv_id,
+            channel,
+            channel_ref or "",
+            len(response.data or []) if getattr(response, "data", None) is not None else "unknown",
+        )
         return conv_id
-    except Exception:
-        logger.exception("ensure_conversation failed; using ephemeral id.")
-        return conv_id
+    except Exception as exc:
+        # PostgREST / Supabase errors often include ``message`` or JSON in ``args``.
+        detail = getattr(exc, "message", None) or getattr(exc, "args", None)
+        logger.exception(
+            "ensure_conversation UPSERT FAILED table=%s conversation_id=%s channel=%s "
+            "channel_ref=%r row=%s detail=%s exc_type=%s",
+            CONV_TABLE,
+            conv_id,
+            channel,
+            channel_ref or "",
+            row,
+            detail,
+            type(exc).__name__,
+        )
+        return None
 
 
 def find_sms_conversation(sender: str) -> str | None:
@@ -136,8 +177,18 @@ def append_message(
         if meta is not None:
             payload["meta"] = meta
         client.table(MSG_TABLE).insert(payload).execute()
-    except Exception:
-        logger.exception("append_message skipped for conversation_id=%s", conversation_id)
+    except Exception as exc:
+        logger.exception(
+            "append_message FAILED table=%s conversation_id=%s role=%s tool_name=%s "
+            "exc_type=%s message=%s payload_preview_keys=%s",
+            MSG_TABLE,
+            conversation_id,
+            role,
+            tool_name,
+            type(exc).__name__,
+            getattr(exc, "message", None) or str(exc),
+            list(payload.keys()),
+        )
 
 
 def load_recent_messages(conversation_id: str, limit: int = 40) -> list[dict[str, Any]]:
@@ -262,7 +313,7 @@ async def run_agent_turn(
     augment_knowledge: bool = True,
 ) -> str:
     """Single user message → assistant reply with tool loop."""
-    msgs: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    msgs: list[dict[str, Any]] = [{"role": "system", "content": render_system_prompt()}]
     prev = load_recent_messages(conversation_id, limit=30)
     msgs.extend(_sanitize_history(prev))
     knowledge_context = ""
@@ -474,7 +525,7 @@ async def test_chat(
         raise HTTPException(status_code=503, detail="XAI_API_KEY is not configured.")
 
     cid = str(uuid.uuid4())
-    msgs: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    msgs: list[dict[str, Any]] = [{"role": "system", "content": render_system_prompt()}]
     msgs.append({"role": "user", "content": message})
     grok_msgs = [*msgs]
 
@@ -547,13 +598,23 @@ async def twilio_webhook(request: Request) -> Response:
         return Response(content=str(twiml), media_type="application/xml")
 
     existing = find_sms_conversation(str(from_num))
-    cid = existing or ensure_conversation(
-        channel="sms",
-        channel_ref=str(from_num),
-        existing_id=None,
-    )
-    if not cid:
-        cid = str(uuid.uuid4())
+    persist_messages = True
+    if existing:
+        cid = existing
+    else:
+        cid = ensure_conversation(
+            channel="sms",
+            channel_ref=str(from_num),
+            existing_id=None,
+        )
+        if not cid:
+            logger.error(
+                "Twilio webhook: fortis_conversations upsert failed for From=%s; "
+                "replying without storing messages (check Supabase logs / schema).",
+                from_num,
+            )
+            cid = str(uuid.uuid4())
+            persist_messages = False
 
     try:
         reply_text = await run_agent_turn(body_text, conversation_id=cid, augment_knowledge=True)
@@ -564,8 +625,9 @@ async def twilio_webhook(request: Request) -> Response:
             "use the Fortis Edge Portal for status and file uploads."
         )
 
-    append_message(cid, role="user", content=body_text)
-    append_message(cid, role="assistant", content=reply_text)
+    if persist_messages:
+        append_message(cid, role="user", content=body_text)
+        append_message(cid, role="assistant", content=reply_text)
 
     sms_body = reply_text
     if len(sms_body) > 1450:
