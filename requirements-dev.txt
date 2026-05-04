@@ -1,2 +1,2 @@
-# Local dev / GitHub Actions (not required at runtime)
+# Local dev only (.github/workflows/ci.yml pins the same pytest range for Actions).
 pytest>=8.0.0,<10
