@@ -58,6 +58,10 @@ def retrieve_knowledge(query: str, limit: int = 5) -> List[Dict]:
     return results
 
 
+# Pricing table text column (Postgres / Supabase schema uses comment_application).
+_FORTIS_PRICING_COMMENT_COL = "comment_application"
+
+
 _MATERIAL_HINT_TERMS = frozenset(
     [
         "bopp",
@@ -401,7 +405,10 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
             res = (
                 supabase.table("fortis_pricing")
                 .select("*")
-                .or_(f"description.ilike.%{term}%,material.ilike.%{term}%,notes.ilike.%{term}%")
+                .or_(
+                    f"{_FORTIS_PRICING_COMMENT_COL}.ilike.%{term}%,material.ilike.%{term}%,"
+                    f"finish.ilike.%{term}%,notes.ilike.%{term}%"
+                )
                 .limit(limit)
                 .execute()
             )
@@ -535,7 +542,7 @@ def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
     lines: list[str] = []
     for row in rows[:5]:
         sku = row.get("sku") or "Unknown SKU"
-        description = row.get("description") or "No description"
+        description = (row.get("comment_application") or row.get("description") or "").strip() or "No description"
         material = row.get("material") or "N/A"
         finish = row.get("finish") or "N/A"
         selected_cost = row.get(qty_key)

@@ -111,7 +111,7 @@ def ingest_pricing():
             pricing_supabase.table("fortis_pricing").insert(
                 {
                     "sku": str(row.get("sku__die_#_generated", "")),
-                    "description": str(row.get("comment__application", "")),
+                    "comment_application": str(row.get("comment__application", "")),
                     "shape": str(row.get("shape", "")),
                     "width_in": row.get("width_in"),
                     "height_in": row.get("height_in"),
