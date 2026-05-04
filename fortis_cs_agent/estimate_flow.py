@@ -178,7 +178,7 @@ def _persist_structured_estimate(
     unit_val = total_val / Decimal(int(qty))
     sku = (str(row.get("sku") or "").strip()) or "CATALOG_ROW"
     desc_parts = [
-        str(row.get("description") or "").strip(),
+        str(row.get("comment_application") or row.get("description") or "").strip(),
         str(draft.get("product_details") or "").strip(),
     ]
     desc = " | ".join(p for p in desc_parts if p)[:650]

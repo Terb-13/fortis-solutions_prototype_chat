@@ -1,15 +1,11 @@
 import logging
-import os
 import re
 from typing import Any, Dict, List
 
-from supabase import create_client
+# Use the same resolved Supabase URL as api.py / store.py (SERVICE_ROLE fallback host).
+from fortis_cs_agent.store import supabase
 
 logger = logging.getLogger(__name__)
-
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_KEY else None
 
 
 def _safe_ilike_term(raw: str) -> str | None:
@@ -413,8 +409,25 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
                 .execute()
             )
         except Exception:
-            logger.warning("retrieve_pricing keyword OR failed term=%r", term, exc_info=True)
-            continue
+            logger.warning(
+                "retrieve_pricing keyword OR (with notes) failed term=%r; retrying without notes",
+                term,
+                exc_info=True,
+            )
+            try:
+                res = (
+                    supabase.table("fortis_pricing")
+                    .select("*")
+                    .or_(
+                        f"{_FORTIS_PRICING_COMMENT_COL}.ilike.%{term}%,material.ilike.%{term}%,"
+                        f"finish.ilike.%{term}%"
+                    )
+                    .limit(limit)
+                    .execute()
+                )
+            except Exception:
+                logger.warning("retrieve_pricing keyword OR failed term=%r", term, exc_info=True)
+                continue
         for row in res.data or []:
             rid = row.get("id")
             if rid in seen_kw:
