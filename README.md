@@ -137,7 +137,7 @@ Configure the Twilio number’s **A Message Comes In** webhook to `POST https://
 
 ## Deploy (Vercel)
 
-`vercel.json` uses the **`@vercel/python`** build for root `main.py` and routes all traffic there (see `requirements.txt` for deps). Set **`SUPABASE_URL`** and **`SUPABASE_SERVICE_ROLE_KEY`** (service role JWT) on the deployment — if `/chat` returns *Conversation store unreachable*, the `fortis_conversations` upsert failed (wrong key, paused project, or missing table). Temporary escape hatch: **`FORTIS_CHAT_RELAX_CONVERSATION_UPSERT=1`** (chat works without saved threads). Set environment variables in the Vercel project. For Twilio signature validation, use the **public** HTTPS URL Twilio calls.
+`vercel.json` uses the **`@vercel/python`** build for root `main.py` and routes all traffic there (see `requirements.txt` for deps). Set **`SUPABASE_URL`** and **`SUPABASE_SERVICE_ROLE_KEY`** (service role JWT) on the deployment. If `/chat` returns *Conversation store unreachable*, read the **PostgREST detail** in the response: **HTTP 400** from `fortis_conversations` usually means the table/columns don’t match the README DDL (not an auth problem). Temporary: **`FORTIS_CHAT_RELAX_CONVERSATION_UPSERT=1`**. For Twilio signature validation, use the **public** HTTPS URL Twilio calls.
 
 ## Project layout
 

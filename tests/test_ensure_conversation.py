@@ -49,11 +49,15 @@ class TestEnsureConversation(unittest.TestCase):
         self.assertEqual(cid, self.valid_uuid)
         client.table.assert_called_with(CONV_TABLE)
         client.table.return_value.upsert.assert_called_once_with(
-            {
-                "id": self.valid_uuid,
-                "channel": "web",
-                "channel_ref": "",
-            }
+            [
+                {
+                    "id": self.valid_uuid,
+                    "channel": "web",
+                    "channel_ref": "",
+                },
+            ],
+            on_conflict="id",
+            default_to_null=False,
         )
 
     @patch("fortis_cs_agent.api._sb")
@@ -66,7 +70,8 @@ class TestEnsureConversation(unittest.TestCase):
         cid = ensure_conversation(channel="web", channel_ref=None, existing_id=None)
         uuid.UUID(cid)
         client.table.return_value.upsert.assert_called_once()
-        row = client.table.return_value.upsert.call_args[0][0]
+        rows = client.table.return_value.upsert.call_args[0][0]
+        row = rows[0]
         self.assertEqual(row["id"], cid)
         self.assertEqual(row["channel"], "web")
 
@@ -85,7 +90,8 @@ class TestEnsureConversation(unittest.TestCase):
         self.assertNotEqual(cid, "not-a-real-uuid")
         uuid.UUID(cid)
         client.table.return_value.upsert.assert_called_once()
-        self.assertEqual(client.table.return_value.upsert.call_args[0][0]["id"], cid)
+        args_row = client.table.return_value.upsert.call_args[0][0]
+        self.assertEqual(args_row[0]["id"], cid)
 
     @patch("fortis_cs_agent.api._sb")
     def test_upsert_failure_returns_none(self, sb: MagicMock) -> None:

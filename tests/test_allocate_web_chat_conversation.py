@@ -60,7 +60,9 @@ class TestAllocateWebChatConversation(unittest.TestCase):
         with self.assertRaises(HTTPException) as ctx:
             allocate_web_chat_conversation(self.valid_uuid)
         self.assertEqual(ctx.exception.status_code, 503)
-        self.assertIn("SUPABASE_SERVICE_ROLE_KEY", str(ctx.exception.detail))
+        detail = str(ctx.exception.detail)
+        self.assertIn("Conversation store unreachable", detail)
+        self.assertIn("service_role", detail.lower())
 
     @patch.dict(
         "fortis_cs_agent.api.os.environ",

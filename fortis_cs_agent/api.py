@@ -87,6 +87,46 @@ def _normalize_conversation_id(existing_id: str | None) -> str:
         return str(uuid.uuid4())
 
 
+def _supabase_rest_error_hint(exc: BaseException, *, limit: int = 420) -> str:
+    parts: list[str] = []
+    for attr in ("code", "message", "details", "hint"):
+        val = getattr(exc, attr, None)
+        if val:
+            parts.append(str(val))
+    return (" ".join(parts) if parts else str(exc)).strip()[:limit]
+
+
+def _upsert_conversation_row(
+    *,
+    conversation_id: str,
+    channel: Literal["sms", "web", "api"],
+    channel_ref: str,
+) -> None:
+    """Insert-or-update fortis_conversations with PostgREST-friendly upsert shape.
+
+    postgrest-py only adds ``columns`` when upsert receives a non-empty **list**.
+    Omitting ``on_conflict`` breaks some deployments (HTTP 400 on merge-duplicates).
+
+    ``default_to_null=False`` emits ``Prefer: missing=default`` so ``created_at`` /
+    ``updated_at`` table defaults remain valid on INSERT.
+    """
+
+    client = _sb()
+    if client is None:
+        raise RuntimeError("_upsert_conversation_row requires a configured Supabase client")
+
+    row: dict[str, Any] = {
+        "id": conversation_id,
+        "channel": channel,
+        "channel_ref": channel_ref or "",
+    }
+    client.table(CONV_TABLE).upsert(
+        [row],
+        on_conflict="id",
+        default_to_null=False,
+    ).execute()
+
+
 def ensure_conversation(
     *,
     channel: Literal["sms", "web", "api"],
@@ -107,34 +147,30 @@ def ensure_conversation(
     if client is None:
         return conv_id
 
-    row = {
-        "id": conv_id,
-        "channel": channel,
-        "channel_ref": channel_ref or "",
-    }
     try:
-        response = client.table(CONV_TABLE).upsert(row).execute()
+        _upsert_conversation_row(
+            conversation_id=conv_id,
+            channel=channel,
+            channel_ref=channel_ref or "",
+        )
         logger.info(
-            "ensure_conversation upsert ok table=%s conversation_id=%s channel=%s channel_ref=%r rows=%s",
+            "ensure_conversation upsert ok table=%s conversation_id=%s channel=%s channel_ref=%r",
             CONV_TABLE,
             conv_id,
             channel,
             channel_ref or "",
-            len(response.data or []) if getattr(response, "data", None) is not None else "unknown",
         )
         return conv_id
     except Exception as exc:
-        # PostgREST / Supabase errors often include ``message`` or JSON in ``args``.
-        detail = getattr(exc, "message", None) or getattr(exc, "args", None)
+        hint = _supabase_rest_error_hint(exc)
         logger.exception(
             "ensure_conversation UPSERT FAILED table=%s conversation_id=%s channel=%s "
-            "channel_ref=%r row=%s detail=%s exc_type=%s",
+            "channel_ref=%r postgrest=%s exc_type=%s",
             CONV_TABLE,
             conv_id,
             channel,
             channel_ref or "",
-            row,
-            detail,
+            hint or "(none)",
             type(exc).__name__,
         )
         return None
@@ -155,24 +191,25 @@ def allocate_web_chat_conversation(existing_id: str | None) -> tuple[str, bool]:
     if client is None:
         return cid, False
 
-    row = {
-        "id": cid,
-        "channel": "web",
-        "channel_ref": "",
-    }
     try:
-        client.table(CONV_TABLE).upsert(row).execute()
+        _upsert_conversation_row(
+            conversation_id=cid,
+            channel="web",
+            channel_ref="",
+        )
         logger.info(
             "allocate_web_chat_conversation upsert ok conversation_id=%s table=%s",
             cid,
             CONV_TABLE,
         )
         return cid, True
-    except Exception:
+    except Exception as exc:
+        hint = _supabase_rest_error_hint(exc)
         logger.exception(
-            "allocate_web_chat_conversation UPSERT FAILED conversation_id=%s table=%s",
+            "allocate_web_chat_conversation UPSERT FAILED conversation_id=%s table=%s postgrest=%s",
             cid,
             CONV_TABLE,
+            hint or "(none)",
         )
         relaxed = os.getenv(
             "FORTIS_CHAT_RELAX_CONVERSATION_UPSERT", ""
@@ -183,16 +220,17 @@ def allocate_web_chat_conversation(existing_id: str | None) -> tuple[str, bool]:
             )
             return cid, False
 
+        base = (
+            "Conversation store unreachable: fortis_conversations upsert failed (see server logs). "
+            "Common causes: Supabase table/schema doesn’t match README (expect id uuid PK, channel, channel_ref, "
+            "created_at, updated_at); or PostgREST rejects the payload. "
+            "Verify Supabase URL + service_role key. "
+            "Temporary: FORTIS_CHAT_RELAX_CONVERSATION_UPSERT=1 (no saved threads)."
+        )
+        extra = f" PostgREST detail: {hint}" if hint else ""
         raise HTTPException(
             status_code=503,
-            detail=(
-                "Conversation store unreachable: upsert into fortis_conversations failed. "
-                "On Vercel, set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY to your project "
-                "(use the **service_role** JWT, not the anon key). "
-                "Confirm the fortis_conversations table exists per README DDL. "
-                "Temporary fallback only: set FORTIS_CHAT_RELAX_CONVERSATION_UPSERT=1 "
-                "(chat replies work but threads are not loaded or saved)."
-            ),
+            detail=(base + extra)[:1600],
         )
 
 
