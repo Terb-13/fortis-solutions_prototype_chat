@@ -23,6 +23,8 @@ from twilio.twiml.messaging_response import MessagingResponse
 from fortis_cs_agent.estimate_models import EstimateRequest
 from fortis_cs_agent.estimate_pdf import write_estimate_pdf_binary
 from fortis_cs_agent.estimate_json import compact_history_hint, parse_assistant_estimate_json
+from fortis_cs_agent.estimate_detector import is_estimate_request
+from fortis_cs_agent.estimate_flow import handle_estimate_flow
 from fortis_cs_agent.knowledge import format_pricing_context, retrieve_knowledge, retrieve_pricing
 from fortis_cs_agent.prompts import render_system_prompt
 from fortis_cs_agent.store import load_estimate_snapshot
@@ -417,7 +419,9 @@ async def run_agent_turn(
             "pdf",
             "formal",
         )
-        pricing_intent = any(word in blob_lower for word in pricing_intent_tokens)
+        pricing_intent = any(word in blob_lower for word in pricing_intent_tokens) or is_estimate_request(
+            pricing_blob
+        )
 
         pricing_results: list[dict[str, Any]] = []
         if pricing_intent:
@@ -532,9 +536,27 @@ async def chat(req: ChatRequest) -> ChatResponse:
     if not cid:
         raise HTTPException(status_code=500, detail="Could not allocate conversation.")
 
+    history = load_recent_messages(cid)
+
+    estimate_flow_result = handle_estimate_flow(
+        user_message=req.message,
+        conversation_history=history,
+        conversation_id=cid,
+    )
+
+    reply: str
+    estimate_id: str | None
+    assistant_meta: dict[str, Any] | None
+
     try:
-        reply = await run_agent_turn(req.message, conversation_id=cid)
-        reply, estimate_id = await persist_estimate_from_assistant_json(reply, conversation_id=cid)
+        if estimate_flow_result.handled:
+            reply = estimate_flow_result.reply
+            estimate_id = estimate_flow_result.estimate_id
+            assistant_meta = estimate_flow_result.assistant_meta
+        else:
+            reply = await run_agent_turn(req.message, conversation_id=cid)
+            reply, estimate_id = await persist_estimate_from_assistant_json(reply, conversation_id=cid)
+            assistant_meta = None
     except HTTPException:
         raise
     except Exception:
@@ -542,7 +564,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
         raise HTTPException(status_code=500, detail="Chat failed.") from None
 
     append_message(cid, role="user", content=req.message)
-    append_message(cid, role="assistant", content=reply)
+    append_message(cid, role="assistant", content=reply, meta=assistant_meta)
     return ChatResponse(reply=reply, conversation_id=cid, estimate_id=estimate_id)
 
 
@@ -651,20 +673,32 @@ async def twilio_webhook(request: Request) -> Response:
             persist_messages = False
 
     try:
-        reply_text = await run_agent_turn(body_text, conversation_id=cid, augment_knowledge=True)
-        reply_text, _estimate_id_saved = await persist_estimate_from_assistant_json(
-            reply_text, conversation_id=cid
+        sms_history = load_recent_messages(cid) if persist_messages else []
+        sms_flow = handle_estimate_flow(
+            user_message=body_text,
+            conversation_history=sms_history,
+            conversation_id=cid,
         )
+        if sms_flow.handled:
+            reply_text = sms_flow.reply
+            assistant_meta_twilio = sms_flow.assistant_meta
+        else:
+            reply_text = await run_agent_turn(body_text, conversation_id=cid, augment_knowledge=True)
+            reply_text, _estimate_id_saved = await persist_estimate_from_assistant_json(
+                reply_text, conversation_id=cid
+            )
+            assistant_meta_twilio = None
     except Exception:
         logger.exception("Twilio agent failed — sending fallback SMS.")
         reply_text = (
             "We couldn’t reply automatically right now. Please email your Fortis rep or "
             "use the Fortis Edge Portal for status and file uploads."
         )
+        assistant_meta_twilio = None
 
     if persist_messages:
         append_message(cid, role="user", content=body_text)
-        append_message(cid, role="assistant", content=reply_text)
+        append_message(cid, role="assistant", content=reply_text, meta=assistant_meta_twilio)
 
     sms_body = reply_text
     if len(sms_body) > 1450:
