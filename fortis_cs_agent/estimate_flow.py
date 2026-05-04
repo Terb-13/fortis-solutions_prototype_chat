@@ -18,6 +18,9 @@ from fortis_cs_agent.knowledge import retrieve_pricing
 
 logger = logging.getLogger(__name__)
 
+# Bumped when changing estimate wizard behavior; exposed on GET /health for deploy verification.
+ESTIMATE_FLOW_BUILD = "wizard-v1"
+
 _STEPS = ("product_details", "business_name", "contact_name", "email", "address")
 _DEFAULT_NOTES = "This quote does not include shipping or taxes. Prices are valid for 30 days."
 

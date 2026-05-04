@@ -24,7 +24,7 @@ from fortis_cs_agent.estimate_models import EstimateRequest
 from fortis_cs_agent.estimate_pdf import write_estimate_pdf_binary
 from fortis_cs_agent.estimate_json import compact_history_hint, parse_assistant_estimate_json
 from fortis_cs_agent.estimate_detector import is_estimate_request
-from fortis_cs_agent.estimate_flow import handle_estimate_flow
+from fortis_cs_agent.estimate_flow import ESTIMATE_FLOW_BUILD, handle_estimate_flow
 from fortis_cs_agent.knowledge import format_pricing_context, retrieve_knowledge, retrieve_pricing
 from fortis_cs_agent.prompts import render_system_prompt
 from fortis_cs_agent.store import load_estimate_snapshot
@@ -504,6 +504,9 @@ async def health() -> dict[str, Any]:
         "grok_configured": bool(XAI_API_KEY),
         "grok_model": XAI_CHAT_MODEL,
         "supabase_configured": supabase is not None,
+        "estimate_flow_build": ESTIMATE_FLOW_BUILD,
+        "vercel_git_commit_sha": (os.getenv("VERCEL_GIT_COMMIT_SHA") or "").strip() or None,
+        "vercel_git_commit_ref": (os.getenv("VERCEL_GIT_COMMIT_REF") or "").strip() or None,
     }
 
 
