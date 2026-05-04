@@ -62,7 +62,7 @@ class TestAllocateWebChatConversation(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 503)
         detail = str(ctx.exception.detail)
         self.assertIn("Conversation store unreachable", detail)
-        self.assertIn("service_role", detail.lower())
+        self.assertIn("fix_fortis_conversations_chat_columns.sql", detail)
 
     @patch.dict(
         "fortis_cs_agent.api.os.environ",

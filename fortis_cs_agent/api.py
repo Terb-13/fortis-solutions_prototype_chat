@@ -222,9 +222,9 @@ def allocate_web_chat_conversation(existing_id: str | None) -> tuple[str, bool]:
 
         base = (
             "Conversation store unreachable: fortis_conversations upsert failed (see server logs). "
-            "Common causes: Supabase table/schema doesn’t match README (expect id uuid PK, channel, channel_ref, "
-            "created_at, updated_at); or PostgREST rejects the payload. "
-            "Verify Supabase URL + service_role key. "
+            "PostgREST PGRST204 on column 'channel' usually means your table predates README — "
+            "run sql/fix_fortis_conversations_chat_columns.sql in Supabase. "
+            "Otherwise confirm schema (id uuid PK, channel, channel_ref, timestamps). "
             "Temporary: FORTIS_CHAT_RELAX_CONVERSATION_UPSERT=1 (no saved threads)."
         )
         extra = f" PostgREST detail: {hint}" if hint else ""

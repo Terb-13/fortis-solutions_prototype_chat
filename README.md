@@ -96,6 +96,10 @@ create table if not exists fortis_knowledge_chunks (
 
 Row Level Security: lock these down to service role or add policies for your app; the backend uses the **service role** key server-side only.
 
+### Legacy table missing `channel` (PostgREST `PGRST204`)
+
+If your project already had `fortis_conversations` **without** `channel` / `channel_ref`, `CREATE TABLE IF NOT EXISTS` above does nothing and `/chat` will fail with **`Could not find the 'channel' column`**. Apply the additive migration **`sql/fix_fortis_conversations_chat_columns.sql`** in the Supabase SQL editor, wait a few seconds for the API schema cache to refresh (or redeploy).
+
 ## API quick reference
 
 **Chat**
@@ -145,6 +149,7 @@ Configure the Twilio number’s **A Message Comes In** webhook to `POST https://
 fortis-chat/
 ├── main.py
 ├── vercel.json
+├── sql/fix_fortis_conversations_chat_columns.sql
 ├── requirements.txt
 ├── .env.example
 ├── README.md
