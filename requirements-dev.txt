@@ -1,2 +1,2 @@
-# Local dev only (.github/workflows/ci.yml pins the same pytest range for Actions).
+# Local dev: pin should match pytest line in .github/workflows/ci.yml
 pytest>=8.0.0,<10
