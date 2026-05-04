@@ -130,7 +130,6 @@ def ingest_pricing():
                     "cost_4000": row.get("cost@4k"),
                     "cost_5000": row.get("cost@5k"),
                     "notes": str(row.get("notes__ganging__tow_priority", "")),
-                    "ganging_priority": str(row.get("notes__ganging__tow_priority", "")),
                 }
             ).execute()
         except Exception as e:
