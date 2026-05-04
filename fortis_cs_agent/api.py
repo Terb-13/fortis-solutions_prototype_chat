@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import uuid
 from typing import Any, Literal
 
@@ -38,6 +39,7 @@ router = APIRouter(tags=["fortis"])
 
 XAI_API_KEY = os.getenv("XAI_API_KEY")
 XAI_CHAT_MODEL = (os.getenv("XAI_CHAT_MODEL") or "").strip() or "grok-4"
+XAI_CHAT_MODEL_FALLBACK = (os.getenv("XAI_CHAT_MODEL_FALLBACK") or "").strip()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 _SUPABASE_RESOLVED_URL = SUPABASE_URL or "https://vapnbelrpaxeafospalc.supabase.co"
@@ -350,33 +352,79 @@ async def _grok_chat(
         "Authorization": f"Bearer {XAI_API_KEY}",
         "Content-Type": "application/json",
     }
-    body: dict[str, Any] = {
-        "model": XAI_CHAT_MODEL,
-        "messages": messages,
-        "temperature": 0.35,
-    }
-    if tools:
-        body["tools"] = tools
-        body["tool_choice"] = "auto"
+
+    candidates: list[str] = []
+    prim = XAI_CHAT_MODEL.strip()
+    if prim:
+        candidates.append(prim)
+    if XAI_CHAT_MODEL_FALLBACK and XAI_CHAT_MODEL_FALLBACK.lower() not in {
+        c.lower() for c in candidates
+    }:
+        candidates.append(XAI_CHAT_MODEL_FALLBACK)
+
+    max_retries = max(1, min(5, int(os.getenv("XAI_CHAT_MAX_RETRIES") or "3")))
+    base_delay_sec = float(os.getenv("XAI_CHAT_RETRY_BASE_SEC") or "1.25")
+
+    transient = frozenset({408, 425, 429, 500, 502, 503, 504})
+    last_status: int | None = None
+    last_upstream = ""
 
     async with httpx.AsyncClient(timeout=120.0) as client:
-        r = await client.post(url, headers=headers, json=body)
-        if r.status_code >= 400:
-            upstream = _parse_grok_error_body(r)
-            logger.error(
-                "Grok API HTTP %s model=%s upstream=%s",
-                r.status_code,
-                XAI_CHAT_MODEL,
-                upstream.replace("\n", " ")[:1200],
-            )
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    f"Grok API error ({r.status_code}, model={XAI_CHAT_MODEL}): {upstream}. "
-                    "Check XAI_API_KEY and model access; set XAI_CHAT_MODEL to a model your key supports."
-                ),
-            )
-        return r.json()
+        for model_slug in candidates:
+            body: dict[str, Any] = {
+                "model": model_slug,
+                "messages": messages,
+                "temperature": 0.35,
+            }
+            if tools:
+                body["tools"] = tools
+                body["tool_choice"] = "auto"
+
+            for attempt in range(max_retries):
+                r = await client.post(url, headers=headers, json=body)
+                if r.status_code < 400:
+                    if model_slug != prim:
+                        logger.info("Grok request succeeded via fallback model %s", model_slug)
+                    return r.json()
+
+                upstream = _parse_grok_error_body(r)
+                last_status = r.status_code
+                last_upstream = upstream
+                transient_like = (
+                    r.status_code in transient
+                    or ("capacity" in upstream.lower())
+                    or ("overload" in upstream.lower())
+                    or ("try again later" in upstream.lower())
+                    or ("temporarily unavailable" in upstream.lower())
+                )
+                will_retry_same_model = transient_like and attempt < max_retries - 1
+
+                logger.error(
+                    "Grok API HTTP %s model=%s attempt=%s/%s upstream=%s",
+                    r.status_code,
+                    model_slug,
+                    attempt + 1,
+                    max_retries,
+                    upstream.replace("\n", " ")[:800],
+                )
+                if will_retry_same_model:
+                    delay = base_delay_sec * (2**attempt)
+                    jitter = random.uniform(0, min(4.0, base_delay_sec))
+                    await asyncio.sleep(delay + jitter)
+                    continue
+
+                break
+
+    assert last_status is not None
+
+    outbound = (
+        f"Grok API error ({last_status}, tried models={','.join(candidates)}): {last_upstream}. "
+        "Upstream may be overloaded—please retry shortly. "
+        "You can set **XAI_CHAT_MODEL_FALLBACK** to another slug your key supports. "
+        "See GET /health (`grok_model`)."
+    )
+    http_status = 503 if last_status in (429, 503) else 502
+    raise HTTPException(status_code=http_status, detail=outbound)
 
 
 def _recent_user_text_for_pricing(prev: list[dict[str, Any]], user_text: str, *, max_prior: int = 6) -> str:
@@ -599,6 +647,7 @@ async def health() -> dict[str, Any]:
         "service": "fortis-cs-agent",
         "grok_configured": bool(XAI_API_KEY),
         "grok_model": XAI_CHAT_MODEL,
+        "grok_fallback_model": XAI_CHAT_MODEL_FALLBACK or None,
         "supabase_configured": supabase is not None,
         "pricing_health": pricing_health_probe(),
         "estimate_flow_build": _estimate_flow.ESTIMATE_FLOW_BUILD,
