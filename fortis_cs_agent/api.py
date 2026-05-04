@@ -365,8 +365,8 @@ async def run_agent_turn(
             knowledge_context = (
                 "Quick Ship label pricing: No fortis_pricing rows matched this thread yet. "
                 "Stay on pressure-sensitive labels; do not cite pouch / flexible film / PET laminate examples or unrelated internal stories as pricing. "
-                "Collect company name, contact name, email, size, qty, material/finish; then call generate_estimate_pdf for pdf_link, "
-                "or create_estimate when they want a saved SKU-level quote record."
+                "Do not invent dollar amounts. Collect company name, contact name, email, brief address, size, qty, material/finish—"
+                "then retrieve pricing / clarify—or once catalog rows appear use create_estimate only with grounded Cost@… numbers."
             )
         else:
             try:

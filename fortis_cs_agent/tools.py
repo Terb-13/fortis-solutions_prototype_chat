@@ -225,8 +225,9 @@ GENERATE_ESTIMATE_PDF_TOOL: dict[str, Any] = {
     "function": {
         "name": "generate_estimate_pdf",
         "description": (
-            "Generate a Fortis Edge indicative estimate PDF link + totals (downloadable PDF workflow). "
-            "Use when the customer wants a formal PDF quote / indicative packaging estimate. "
+            "Alternate workflow: generate an indicative estimate PDF link (packaging categories beyond Quick Ship labels). "
+            "For Quick Ship label quotes with catalog rows in context, prefer create_estimate first. "
+            "Use when the customer explicitly wants a PDF download or non-catalog packaging estimate. "
             "Call as soon as you have: customer_name (contact person), company (business name — ask if missing), "
             "email (required for routing), product_type (usually pressure_sensitive_labels for Quick Ship labels), "
             "quantity, width/height in inches when known (use catalog nearest match from pricing context if needed), "
@@ -303,11 +304,14 @@ CREATE_ESTIMATE_TOOL: dict[str, Any] = {
     "function": {
         "name": "create_estimate",
         "description": (
-            "Save a formal structured estimate / quote to Fortis (Supabase) with SKU line items and computed totals. "
-            "Use when the customer wants an official saved quote, a record they can share via link, or line-level SKU pricing "
-            "grounded in catalog/pricing context (not the PDF generator). "
-            "Collect business details and build items[] from confirmed SKUs, descriptions, quantities, unit_price, and line totals. "
-            "conversation_id is normally injected by the server from the active chat thread—you may omit it or leave it empty."
+            "PRIMARY quoting tool for this agent: persist a saved estimate customers can open via link. "
+            "Do NOT invent dollar amounts in chat—when Pricing Agent Context lists Quick Ship rows, "
+            "you MUST call this tool to finalize numbers. "
+            "Build items[] from those rows: sku + description + quantity exactly as quoted; "
+            "set items[].total to the numeric Cost@QTY tier shown for that row (extended total); "
+            "set items[].unit_price = total ÷ quantity (same catalog math—never guess). "
+            "If no pricing rows matched the request, ask one clarifying question or say catalog did not match—do not fabricate prices. "
+            "conversation_id is injected server-side when omitted."
         ),
         "parameters": {
             "type": "object",
@@ -405,8 +409,8 @@ SEARCH_PRODUCTS_TOOL: dict[str, Any] = {
 
 
 AGENT_TOOLS: list[dict[str, Any]] = [
-    GENERATE_ESTIMATE_PDF_TOOL,
     CREATE_ESTIMATE_TOOL,
+    GENERATE_ESTIMATE_PDF_TOOL,
     GET_PORTAL_STATUS_TOOL,
     GET_SBU_METRICS_TOOL,
     SEARCH_PRODUCTS_TOOL,
@@ -676,7 +680,7 @@ def search_products(*, query: str, limit: int = 5) -> dict[str, Any]:
     return {
         "query": query,
         "matches": top,
-        "hint": "Pick product_type from matches and pass to generate_estimate_pdf.",
+        "hint": "Pick product_type from matches; use generate_estimate_pdf for PDF/non-catalog flows, otherwise prefer create_estimate with catalog-backed lines.",
     }
 
 
