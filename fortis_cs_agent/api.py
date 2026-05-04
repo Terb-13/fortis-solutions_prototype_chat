@@ -6,6 +6,7 @@ Logging and error handling mirror a typical production FastAPI service.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -21,6 +22,7 @@ from twilio.twiml.messaging_response import MessagingResponse
 
 from fortis_cs_agent.estimate_models import EstimateRequest
 from fortis_cs_agent.estimate_pdf import write_estimate_pdf_binary
+from fortis_cs_agent.estimate_json import compact_history_hint, parse_assistant_estimate_json
 from fortis_cs_agent.knowledge import format_pricing_context, retrieve_knowledge, retrieve_pricing
 from fortis_cs_agent.prompts import render_system_prompt
 from fortis_cs_agent.store import load_estimate_snapshot
@@ -302,8 +304,75 @@ def _sanitize_history(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if role == "tool":
             # Skip replaying opaque tool payloads into Grok unless you store canonical tool messages.
             continue
+        if role == "assistant" and parse_assistant_estimate_json(content):
+            # Keeps transcripts readable and prevents confusing follow-up turns ("reset" greetings).
+            content = compact_history_hint()
+
         msgs.append({"role": role, "content": content})
     return msgs
+
+
+def _quote_view_absolute_url(estimate_id: str) -> str:
+    pub = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+    tail = f"/quote/{estimate_id}"
+    return f"{pub}{tail}" if pub else tail
+
+
+async def persist_estimate_from_assistant_json(
+    raw_reply: str,
+    *,
+    conversation_id: str,
+) -> tuple[str, str | None]:
+    """Parse Grok-authored estimate JSON, persist row, replace reply with shopper-friendly copy."""
+    parsed = parse_assistant_estimate_json(raw_reply)
+    if parsed is None:
+        return raw_reply, None
+
+    from fortis_cs_agent.tools import insert_fortis_estimate
+
+    def _insert() -> dict[str, Any]:
+        return insert_fortis_estimate(
+            conversation_id,
+            parsed["business_name"],
+            parsed["contact_name"],
+            parsed["email"],
+            parsed.get("phone") or "",
+            parsed.get("address") or "",
+            parsed["items"],
+            parsed["notes"],
+        )
+
+    try:
+        out = await asyncio.to_thread(_insert)
+    except Exception:
+        logger.exception(
+            "estimate_json persistence failed conversation_id=%s business=%s",
+            conversation_id,
+            parsed.get("business_name"),
+        )
+        excerpt = raw_reply.strip()[:800]
+        return (
+            "We captured structured estimate JSON from the assistant, but saving to Supabase failed "
+            "(check server logs / `fortis_estimates` schema + `SUPABASE_SERVICE_ROLE_KEY`).\n\n"
+            f"Draft excerpt:\n{excerpt}",
+            None,
+        )
+
+    qid = str(out.get("estimate_id", "")).strip()
+    link = _quote_view_absolute_url(qid)
+    friendly = (
+        f"Estimate saved.\n\n"
+        f"View your quote: {link}\n"
+        f"Quote reference: `{qid}`"
+    )
+
+    logger.info(
+        "estimate_json persisted estimate_id=%s conversation_id=%s",
+        qid,
+        conversation_id,
+    )
+
+    return friendly, qid or None
 
 
 async def run_agent_turn(
@@ -312,7 +381,7 @@ async def run_agent_turn(
     conversation_id: str,
     augment_knowledge: bool = True,
 ) -> str:
-    """Single user message → assistant reply with tool loop."""
+    """Resolve a single conversational turn (/chat disables Grok tool calls — quotes serialize as JSON)."""
     msgs: list[dict[str, Any]] = [{"role": "system", "content": render_system_prompt()}]
     prev = load_recent_messages(conversation_id, limit=30)
     msgs.extend(_sanitize_history(prev))
@@ -364,9 +433,8 @@ async def run_agent_turn(
         elif pricing_intent:
             knowledge_context = (
                 "Quick Ship label pricing: No fortis_pricing rows matched this thread yet. "
-                "Stay on pressure-sensitive labels; do not cite pouch / flexible film / PET laminate examples or unrelated internal stories as pricing. "
-                "Do not invent dollar amounts. Collect company name, contact name, email, brief address, size, qty, material/finish—"
-                "then retrieve pricing / clarify—or once catalog rows appear use create_estimate only with grounded Cost@… numbers."
+                "Stay on pressure-sensitive labels; do not cite pouch / flexible film examples. "
+                "Collect missing customer + address fields normally. Never invent dollars in prose."
             )
         else:
             try:
@@ -381,67 +449,31 @@ async def run_agent_turn(
         augmented = "Internal knowledge:\n" + knowledge_context + "\n\nCustomer message:\n" + user_text
     msgs.append({"role": "user", "content": augmented})
 
-    tools_list = AGENT_TOOLS
-
     grok_msgs = [*msgs]
 
-    max_tool_rounds = 10
-    for _ in range(max_tool_rounds):
-        try:
-            data = await _grok_chat(grok_msgs, tools=tools_list)
-        except HTTPException:
-            raise
-        except Exception:
-            logger.exception("Grok invocation failed in run_agent_turn (conversation_id=%s).", conversation_id)
-            raise HTTPException(status_code=502, detail="Upstream model unavailable.") from None
+    try:
+        data = await _grok_chat(grok_msgs, tools=None)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Grok invocation failed in run_agent_turn (conversation_id=%s).", conversation_id)
+        raise HTTPException(status_code=502, detail="Upstream model unavailable.") from None
 
-        try:
-            choice = data["choices"][0]["message"]
-        except (KeyError, IndexError, TypeError):
-            logger.exception("Grok returned unexpected response shape (conversation_id=%s).", conversation_id)
-            return "(Something went wrong parsing the assistant response—please try again.)"
+    try:
+        choice = data["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError):
+        logger.exception("Grok returned unexpected response shape (conversation_id=%s).", conversation_id)
+        return "(Something went wrong parsing the assistant response—please try again.)"
 
-        tc = choice.get("tool_calls") or []
-        assistant_msg: dict[str, Any] = {"role": "assistant"}
-        assistant_msg.update(choice)
+    tc = choice.get("tool_calls") or []
+    if tc:
+        logger.warning(
+            "Unexpected tool_calls from Grok despite tools disabled (conversation_id=%s)",
+            conversation_id,
+        )
 
-        grok_msgs.append(assistant_msg)
-
-        if tc:
-            for call in tc:
-                fname = call.get("function", {}).get("name")
-                args_raw = call.get("function", {}).get("arguments") or "{}"
-                try:
-                    args = json.loads(args_raw)
-                except json.JSONDecodeError:
-                    logger.warning("tool_call_invalid_json tool=%s raw=%s", fname, args_raw[:200])
-                    args = {}
-
-                payload = execute_agent_tool(
-                    fname or "",
-                    args,
-                    persist_estimate=True,
-                    conversation_id=conversation_id,
-                )
-                try:
-                    tool_body = json.dumps(payload, default=str)
-                except Exception:
-                    logger.exception("tool payload json.dumps failed tool=%s", fname)
-                    tool_body = json.dumps({"error": "serialization_failed", "tool": fname})
-                grok_msgs.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call.get("id", "call"),
-                        "content": tool_body,
-                    }
-                )
-            continue
-
-        content = choice.get("content") or ""
-        return content.strip() or "(No response text from model.)"
-
-    logger.error("run_agent_turn exceeded max_tool_rounds conversation_id=%s", conversation_id)
-    return "(I hit a processing limit—please resend your question in one message.)"
+    content = choice.get("content") or ""
+    return content.strip() or "(No response text from model.)"
 
 
 # --- Request models -------------------------------------------------------------------
@@ -455,6 +487,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     reply: str
     conversation_id: str
+    estimate_id: str | None = None
 
 
 # --- Routes ---------------------------------------------------------------------------
@@ -501,6 +534,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
 
     try:
         reply = await run_agent_turn(req.message, conversation_id=cid)
+        reply, estimate_id = await persist_estimate_from_assistant_json(reply, conversation_id=cid)
     except HTTPException:
         raise
     except Exception:
@@ -509,7 +543,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
 
     append_message(cid, role="user", content=req.message)
     append_message(cid, role="assistant", content=reply)
-    return ChatResponse(reply=reply, conversation_id=cid)
+    return ChatResponse(reply=reply, conversation_id=cid, estimate_id=estimate_id)
 
 
 @router.get("/test-chat", response_model=ChatResponse)
@@ -517,10 +551,10 @@ async def test_chat(
     message: str = Query(
         ...,
         min_length=1,
-        description="Ephemeral Grok probe (same tools as POST /chat, no persistence).",
+        description="Ephemeral Grok probe (still enables legacy tool stack; differs from POST /chat JSON quotes).",
     ),
 ) -> ChatResponse:
-    """GET convenience for probes and scripted checks — no Supabase writes."""
+    """GET probe for Grok + tools (does not mirror production /chat JSON-quote mode)."""
     if not XAI_API_KEY:
         raise HTTPException(status_code=503, detail="XAI_API_KEY is not configured.")
 
@@ -618,6 +652,9 @@ async def twilio_webhook(request: Request) -> Response:
 
     try:
         reply_text = await run_agent_turn(body_text, conversation_id=cid, augment_knowledge=True)
+        reply_text, _estimate_id_saved = await persist_estimate_from_assistant_json(
+            reply_text, conversation_id=cid
+        )
     except Exception:
         logger.exception("Twilio agent failed — sending fallback SMS.")
         reply_text = (

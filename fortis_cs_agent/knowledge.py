@@ -519,13 +519,12 @@ def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
         )
 
     parts.append(
-        "Saved quote (primary): When contact + business + email + address + line detail exist OR user confirms, "
-        "call create_estimate—populate items[] totals strictly from the Cost@… lines above; never invent prices in prose; "
-        "conversation_id is filled server-side."
+        "Quote completion: When required customer fields + SKU detail are settled, assistants emit STRICT JSON payloads "
+        "for the backend (see system prompt). Map totals/unit_price ONLY from Cost@ tiers listed above—never hallucinate SKU "
+        "dollar amounts in conversational prose beforehand."
     )
     parts.append(
-        "PDF alternate only: Use generate_estimate_pdf only when they explicitly want a downloadable PDF estimate "
-        "or non-catalog packaging—not as the default for Quick Ship rows listed above."
+        "PDF alternate only: Reserve generate_estimate_pdf for explicit downloadable PDF tooling outside structured JSON quotes."
     )
     parts.append(
         "Guided follow-up: One question only when possible; labels only — never pivot to pouches/corrugated unless the user asks."
