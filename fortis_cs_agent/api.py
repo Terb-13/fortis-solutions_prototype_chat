@@ -140,6 +140,62 @@ def ensure_conversation(
         return None
 
 
+def allocate_web_chat_conversation(existing_id: str | None) -> tuple[str, bool]:
+    """Return (conversation_uuid, persist_thread).
+
+    Persist is ``False`` when Supabase isn't configured.
+
+    Upsert failures raise ``HTTPException`` (503) with an actionable hint, unless env
+    ``FORTIS_CHAT_RELAX_CONVERSATION_UPSERT`` is true — then persistence is skipped and Grok runs
+    with an empty server-side history.
+    """
+
+    cid = _normalize_conversation_id(existing_id)
+    client = _sb()
+    if client is None:
+        return cid, False
+
+    row = {
+        "id": cid,
+        "channel": "web",
+        "channel_ref": "",
+    }
+    try:
+        client.table(CONV_TABLE).upsert(row).execute()
+        logger.info(
+            "allocate_web_chat_conversation upsert ok conversation_id=%s table=%s",
+            cid,
+            CONV_TABLE,
+        )
+        return cid, True
+    except Exception:
+        logger.exception(
+            "allocate_web_chat_conversation UPSERT FAILED conversation_id=%s table=%s",
+            cid,
+            CONV_TABLE,
+        )
+        relaxed = os.getenv(
+            "FORTIS_CHAT_RELAX_CONVERSATION_UPSERT", ""
+        ).lower() in ("1", "true", "yes")
+        if relaxed:
+            logger.warning(
+                "FORTIS_CHAT_RELAX_CONVERSATION_UPSERT enabled — /chat proceeding without persisted threads"
+            )
+            return cid, False
+
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Conversation store unreachable: upsert into fortis_conversations failed. "
+                "On Vercel, set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY to your project "
+                "(use the **service_role** JWT, not the anon key). "
+                "Confirm the fortis_conversations table exists per README DDL. "
+                "Temporary fallback only: set FORTIS_CHAT_RELAX_CONVERSATION_UPSERT=1 "
+                "(chat replies work but threads are not loaded or saved)."
+            ),
+        )
+
+
 def find_sms_conversation(sender: str) -> str | None:
     """Return existing SMS thread id keyed by caller number."""
     client = _sb()
@@ -533,15 +589,9 @@ async def estimate_pdf_download(estimate_id: str) -> StreamingResponse:
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
-    cid = ensure_conversation(
-        channel="web",
-        channel_ref=None,
-        existing_id=req.conversation_id,
-    )
-    if not cid:
-        raise HTTPException(status_code=500, detail="Could not allocate conversation.")
+    cid, persist = allocate_web_chat_conversation(req.conversation_id)
 
-    history = load_recent_messages(cid)
+    history = load_recent_messages(cid) if persist else []
 
     estimate_flow_result = _estimate_flow.handle_estimate_flow(
         user_message=req.message,
@@ -568,8 +618,9 @@ async def chat(req: ChatRequest) -> ChatResponse:
         logger.exception("chat pipeline failed (conversation_id=%s)", cid)
         raise HTTPException(status_code=500, detail="Chat failed.") from None
 
-    append_message(cid, role="user", content=req.message)
-    append_message(cid, role="assistant", content=reply, meta=assistant_meta)
+    if persist:
+        append_message(cid, role="user", content=req.message)
+        append_message(cid, role="assistant", content=reply, meta=assistant_meta)
     return ChatResponse(reply=reply, conversation_id=cid, estimate_id=estimate_id)
 
 
