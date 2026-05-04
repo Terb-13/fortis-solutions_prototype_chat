@@ -36,5 +36,9 @@ export default async function QuotePage({ params }: PageProps) {
     notFound();
   }
 
-  return <QuoteDocument quote={quote} />;
+  return (
+    <main className="min-h-dvh bg-stone-100 print:min-h-0 print:bg-white">
+      <QuoteDocument quote={quote} />
+    </main>
+  );
 }

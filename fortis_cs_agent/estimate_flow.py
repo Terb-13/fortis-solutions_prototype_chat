@@ -19,7 +19,7 @@ from fortis_cs_agent.knowledge import retrieve_pricing
 logger = logging.getLogger(__name__)
 
 # Bumped when changing estimate wizard behavior; exposed on GET /health for deploy verification.
-ESTIMATE_FLOW_BUILD = "wizard-v2-pricing-health"
+ESTIMATE_FLOW_BUILD = "wizard-v3-quote-summary-ui"
 
 _STEPS = ("product_details", "business_name", "contact_name", "email", "address")
 _DEFAULT_NOTES = "This quote does not include shipping or taxes. Prices are valid for 30 days."
@@ -83,9 +83,43 @@ def _looks_like_email(s: str) -> bool:
 
 
 def _quote_absolute_url(estimate_id: str) -> str:
-    pub = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+    pub = (
+        os.getenv("PUBLIC_BASE_URL")
+        or os.getenv("NEXT_PUBLIC_QUOTE_SITE_URL")
+        or ""
+    ).strip().rstrip("/")
     tail = f"/quote/{estimate_id}"
     return f"{pub}{tail}" if pub else tail
+
+
+def _cost_key_human_label(cost_key: str) -> str:
+    tier = (
+        ("cost_100", "100-label"),
+        ("cost_250", "250-label"),
+        ("cost_500", "500-label"),
+        ("cost_1000", "1,000-label"),
+        ("cost_1500", "1,500-label"),
+        ("cost_2000", "2,000-label"),
+        ("cost_2500", "2,500-label"),
+        ("cost_3000", "3,000-label"),
+        ("cost_4000", "4,000-label"),
+        ("cost_5000", "5,000-label"),
+    )
+    for key, lab in tier:
+        if cost_key == key:
+            return lab
+    return cost_key.replace("cost_", "").replace("_", " ")
+
+
+def _catalog_match_sentence(row: dict[str, Any]) -> str | None:
+    tag = str(row.get("_fortis_pricing_match") or "").strip()
+    if tag in ("closest_size", "closest_fallback"):
+        return (
+            "**Closest match:** This total is driven by the **nearest available Quick Ship line** "
+            "in our pricing grid for your quantity and specs. Confirm the SKU and description on your quote page "
+            "before committing to production."
+        )
+    return None
 
 
 def latest_estimate_flow_snapshot(history_rows: list[dict[str, Any]]) -> tuple[dict[str, Any], int] | None:
@@ -215,11 +249,45 @@ def _persist_structured_estimate(
 
     eid = str(result.get("estimate_id", "") or "").strip()
     link = _quote_absolute_url(eid)
+    mat = str(row.get("material") or "").strip()
+    fin = str(row.get("finish") or "").strip()
+    if mat and fin:
+        mat_fin = f"{mat}, {fin}"
+    elif mat:
+        mat_fin = mat
+    elif fin:
+        mat_fin = fin
+    else:
+        mat_fin = "See catalog row on quote"
+
+    total_str = f"${float(total_val):,.2f}"
+    unit_str = f"${float(unit_val.quantize(Decimal('0.0001'))):,.4f}"
+    qty_str = f"{int(qty):,}"
+
+    tier_line = (
+        f"Catalog pricing tier applied: **{_cost_key_human_label(ck)}** bracket (matched to your requested quantity)."
+    )
+
+    match_txt = _catalog_match_sentence(row)
+    lines_note = f"\n\n{match_txt}" if match_txt else ""
+
     friendly = (
-        "Estimate locked in.\n\n"
-        f"**View quote:** {link}\n"
-        f"Quote ID `{eid}`\n\n"
-        "Questions? Just reply here."
+        "Thank you — your structured **Quick Ship** estimate has been saved. "
+        "Below is a concise pricing summary matched to our Quick Ship pricing grid.\n\n"
+        "### Pricing summary\n"
+        f"- **SKU:** `{sku}`\n"
+        f"- **Quantity:** {qty_str} labels\n"
+        f"- **Unit price:** {unit_str} per label (extended total shown below divided by qty)\n"
+        f"- **Line total:** {total_str}\n"
+        f"- **Material / finish (catalog row):** {mat_fin}\n"
+        f"- {tier_line}"
+        f"{lines_note}"
+        "\n\n### Your quote\n"
+        f"Here's your quote: {link}\n\n"
+        f"Quote reference · `{eid}`\n\n"
+        "**Terms:** Quote valid **30 days**; does **not** include shipping or taxes (same notes appear on your quote page).\n\n"
+        "If anything looks off versus what you typed, reply here before you place the order—we’re happy to double-check "
+        "the nearest catalog line or walk you through the next steps."
     )
     return friendly, eid
 

@@ -14,20 +14,40 @@
   }
 
   @media print {
+    @page {
+      margin: 0.55in;
+    }
+
     body {
       @apply bg-white;
     }
+
+    thead {
+      display: table-header-group;
+    }
+
+    tr {
+      break-inside: avoid;
+    }
+
     .quote-no-print {
       display: none !important;
     }
+
     .quote-sheet {
       max-width: none;
       border-radius: 0;
       border: none;
       box-shadow: none;
     }
+
     .quote-break-inside-avoid {
       break-inside: avoid;
+    }
+
+    /* Safari / Chromium: sharper table rules when printing */
+    .quote-table-wrap {
+      border: 1px solid #e7e5e4 !important;
     }
   }
 }
