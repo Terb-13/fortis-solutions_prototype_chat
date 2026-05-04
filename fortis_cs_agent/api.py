@@ -24,6 +24,8 @@ from fortis_cs_agent.estimate_models import EstimateRequest
 from fortis_cs_agent.estimate_pdf import write_estimate_pdf_binary
 from fortis_cs_agent.estimate_json import compact_history_hint, parse_assistant_estimate_json
 from fortis_cs_agent.estimate_detector import is_estimate_request
+
+# Bind estimate_flow only via _estimate_flow (avoid a second import from the estimate_flow submodule).
 from fortis_cs_agent import estimate_flow as _estimate_flow
 from fortis_cs_agent.knowledge import format_pricing_context, retrieve_knowledge, retrieve_pricing
 from fortis_cs_agent.prompts import render_system_prompt
