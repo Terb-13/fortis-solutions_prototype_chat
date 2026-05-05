@@ -115,6 +115,49 @@ _WIZARD_META_CHATTER_RE = re.compile(
 _SHOPPER_LINE_SPLIT_RE = re.compile(
     r"(?i)\b(?:customer|user|shopper|client)\s+message\s*:\s*",
 )
+
+# Portal forwards a full markdown transcript; only the last "User:" line is the real turn text.
+_THREAD_START_RE = re.compile(r"(?i)---\s*thread\s*---")
+_THREAD_END_RE = re.compile(r"(?i)---\s*end\s+thread\s*---")
+_FULL_THREAD_INSTRUCTION_RE = re.compile(r"(?i)use\s+the\s+full\s+thread\s+below")
+_RESPOND_RECENT_RE = re.compile(r"(?i)respond\s+to\s+the\s+most\s+recent\s+user\s+message")
+
+
+def _extract_last_thread_user_line(blob: str) -> str | None:
+    """
+    If ``blob`` looks like a wrapped transcript, return the last ``User:`` utterance only.
+
+    Returns:
+        ``None`` — not in this format (keep caller's text).
+        ``""`` — looks like a transcript but no user line was found.
+        non-empty str — the shopper's actual last line.
+    """
+    t = (blob or "").strip()
+    if not t:
+        return None
+    transcriptish = (
+        _FULL_THREAD_INSTRUCTION_RE.search(t) is not None
+        or _THREAD_START_RE.search(t) is not None
+        or _THREAD_END_RE.search(t) is not None
+        or _RESPOND_RECENT_RE.search(t) is not None
+    )
+    if not transcriptish:
+        return None
+
+    end_m = _THREAD_END_RE.search(t)
+    if end_m:
+        t = t[: end_m.start()].strip()
+
+    found = re.findall(r"(?i)\bUser:\s*([^\n\r]+)", t)
+    if not found:
+        return ""
+
+    line = found[-1].strip()
+    # Trim accidental trailing markers if "--- End thread ---" was inlined on same line.
+    line = _THREAD_END_RE.sub("", line).strip()
+    return line if line else ""
+
+
 # Substrings, not ^-anchored, so leading greetings still match.
 _WIZARD_OPENER_HARD_BLOCK_RE = re.compile(
     r"(?i)"
@@ -255,6 +298,10 @@ def shopper_utterance_for_estimate_heuristics(message: str) -> str:
 
     Model/RAG wrappers often end with ``Customer message:`` / ``User message:`` + the user’s words;
     scanning the whole blob falsely matches training words like “quote” / “pricing” and starts the wizard.
+
+    Some front-ends send a full ``--- Thread ---`` block plus ``Use the full thread below…``; the
+    estimate flow must use only the **last** ``User:`` line or it will treat assistant copy as the
+    shopper’s specs (bad Step 1) or as the business name (stuck or wrong Step 2).
     """
     t = (message or "").strip()
     if not t:
@@ -266,7 +313,13 @@ def shopper_utterance_for_estimate_heuristics(message: str) -> str:
         core = parts[-1].strip()
         if core:
             t = core
-    return t.strip()
+
+    extracted = _extract_last_thread_user_line(t)
+    if extracted is None:
+        return t.strip()
+    if extracted == "":
+        return ""
+    return extracted.strip()
 
 
 def should_skip_estimate_wizard_opener(message: str) -> bool:

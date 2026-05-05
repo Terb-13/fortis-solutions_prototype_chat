@@ -22,7 +22,7 @@ from fortis_cs_agent.tools import execute_agent_tool
 logger = logging.getLogger(__name__)
 
 # Bumped when changing estimate wizard behavior; exposed on GET /health for deploy verification.
-ESTIMATE_FLOW_BUILD = "wizard-v11-step-field-validation"
+ESTIMATE_FLOW_BUILD = "wizard-v12-thread-user-extract"
 
 _STEPS = ("product_details", "business_name", "contact_name", "email", "address")
 _DEFAULT_NOTES = "This quote does not include shipping or taxes. Prices are valid for 30 days."
@@ -299,7 +299,10 @@ def _recover_snapshot_after_step1_prompt(
     for urow in history_rows[idx_step1 + 1 :]:
         if urow.get("role") != "user":
             continue
-        u = (urow.get("content") or "").strip()
+        raw_u = (urow.get("content") or "").strip()
+        if not raw_u:
+            continue
+        u = shopper_utterance_for_estimate_heuristics(raw_u)
         if not u:
             continue
         if _looks_like_labeled_estimate_form(u):

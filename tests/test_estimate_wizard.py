@@ -83,6 +83,91 @@ class TestWrappedCustomerMessageBlob(unittest.TestCase):
         )
 
 
+def _portal_thread_blob(last_user_line: str, *, assistant_has_specs: bool = False) -> str:
+    """Mimic group-portal proxy: full markdown transcript + trailing instruction tail."""
+    assistant = (
+        "Hello! We do Quick Ship 2x3 white BOPP gloss CMYK 5000 labels."
+        if assistant_has_specs
+        else "Hello! I can help with packaging questions."
+    )
+    return (
+        "Use the full thread below for context only. Respond to the most recent user message. "
+        "If they ask something new or unrelated, answer that directly.\n\n"
+        "--- Thread ---\n"
+        "User: what can you do?\n\n"
+        f"Assistant: {assistant}\n\n"
+        f"User: {last_user_line}\n"
+        "--- End thread ---\n\n"
+        "Respond to the most recent user message using the thread above."
+    )
+
+
+class TestFullThreadProxyBlob(unittest.TestCase):
+    """Regression: proxy sends --- Thread --- wrappers; wizard must use last User: line only."""
+
+    def test_create_estimate_blob_is_cold_opener_not_polluted_specs(self) -> None:
+        blob = _portal_thread_blob("can you create an estimate?", assistant_has_specs=True)
+        r = handle_estimate_flow(
+            user_message=blob,
+            conversation_history=[],
+            conversation_id="00000000-0000-4000-8000-000000000060",
+        )
+        self.assertTrue(r.handled)
+        self.assertNotIn("I’ve captured", r.reply)
+        self.assertNotIn("Use the full thread", r.reply)
+        self.assertIn("Step 1/5", r.reply)
+        assert r.assistant_meta is not None
+        self.assertEqual(r.assistant_meta["estimate_flow"]["pending_step_index"], 0)
+        self.assertFalse((r.assistant_meta["estimate_flow"]["draft"] or {}).get("product_details"))
+
+    def test_specs_only_last_user_line_advances_or_clean_partial(self) -> None:
+        blob = _portal_thread_blob("2x3 white bopp, 5000, gloss, cmyk", assistant_has_specs=True)
+        r = handle_estimate_flow(
+            user_message=blob,
+            conversation_history=[],
+            conversation_id="00000000-0000-4000-8000-000000000061",
+        )
+        self.assertTrue(r.handled)
+        assert r.assistant_meta is not None
+        pd = str((r.assistant_meta["estimate_flow"]["draft"] or {}).get("product_details") or "")
+        self.assertIn("2x3", pd)
+        self.assertIn("5000", pd)
+        self.assertNotIn("Hello!", pd)
+        self.assertNotIn("Use the full thread", pd)
+        self.assertEqual(r.assistant_meta["estimate_flow"]["pending_step_index"], 1)
+        self.assertIn("Step 2/5", r.reply)
+
+    def test_step2_thread_wrap_advances(self) -> None:
+        hist = [
+            {
+                "role": "assistant",
+                "content": "**Step 2/5:** …",
+                "meta": {
+                    "estimate_flow": {
+                        "active": True,
+                        "version": 1,
+                        "pending_step_index": 1,
+                        "draft": {
+                            "product_details": "5000 2x3 white bopp gloss cmyk",
+                            "_quantity_hint": 5000,
+                        },
+                    }
+                },
+            }
+        ]
+        blob = _portal_thread_blob("lloydco", assistant_has_specs=False)
+        r = handle_estimate_flow(
+            user_message=blob,
+            conversation_history=hist,
+            conversation_id="00000000-0000-4000-8000-000000000062",
+        )
+        self.assertTrue(r.handled)
+        assert r.assistant_meta is not None
+        self.assertEqual(r.assistant_meta["estimate_flow"]["pending_step_index"], 2)
+        self.assertEqual(r.assistant_meta["estimate_flow"]["draft"].get("business_name"), "lloydco")
+        self.assertIn("Step 3/5", r.reply)
+
+
 class TestShouldSkipWizardOpener(unittest.TestCase):
     def test_blocks_meta_and_refusals(self) -> None:
         for msg in (
