@@ -342,5 +342,109 @@ class TestEstimateWizardFlow(unittest.TestCase):
             self.assertFalse(r.handled, msg=repr(msg))
 
 
+class TestWizardStepValidation(unittest.TestCase):
+    """Invalid short answers should acknowledge, re-ask differently, and stay on the same step."""
+
+    def _history_at_step(self, pending: int, draft: dict) -> list[dict]:
+        return [
+            {
+                "role": "assistant",
+                "content": f"**Step {pending + 1}/5:** …",
+                "meta": {
+                    "estimate_flow": {
+                        "active": True,
+                        "version": 1,
+                        "pending_step_index": pending,
+                        "draft": dict(draft),
+                    }
+                },
+            }
+        ]
+
+    def test_step2_gibberish_stays_with_varied_reply(self) -> None:
+        hist = self._history_at_step(
+            1,
+            {"product_details": "1000 2x3 bopp gloss cmyk", "_quantity_hint": 1000},
+        )
+        r = handle_estimate_flow(
+            user_message="wtf",
+            conversation_history=hist,
+            conversation_id="00000000-0000-4000-8000-000000000050",
+        )
+        self.assertTrue(r.handled)
+        assert r.assistant_meta is not None
+        self.assertEqual(r.assistant_meta["estimate_flow"]["pending_step_index"], 1)
+        self.assertIsNone(r.assistant_meta["estimate_flow"]["draft"].get("business_name"))
+        self.assertIn("(again)", r.reply)
+        self.assertIn("**wtf**", r.reply)
+        self.assertNotIn("What **business name** should appear on the quote?", r.reply)
+
+    def test_step2_too_short_then_valid_advances(self) -> None:
+        hist = self._history_at_step(
+            1,
+            {"product_details": "1000 2x3 bopp gloss cmyk", "_quantity_hint": 1000},
+        )
+        r_short = handle_estimate_flow(
+            user_message="Co",
+            conversation_history=hist,
+            conversation_id="00000000-0000-4000-8000-000000000051",
+        )
+        self.assertTrue(r_short.handled)
+        assert r_short.assistant_meta is not None
+        self.assertEqual(r_short.assistant_meta["estimate_flow"]["pending_step_index"], 1)
+
+        r_ok = handle_estimate_flow(
+            user_message="lloydco",
+            conversation_history=hist,
+            conversation_id="00000000-0000-4000-8000-000000000052",
+        )
+        self.assertTrue(r_ok.handled)
+        assert r_ok.assistant_meta is not None
+        self.assertEqual(r_ok.assistant_meta["estimate_flow"]["pending_step_index"], 2)
+        self.assertEqual(r_ok.assistant_meta["estimate_flow"]["draft"].get("business_name"), "lloydco")
+
+    def test_step3_contact_invalid_stays(self) -> None:
+        hist = self._history_at_step(
+            2,
+            {
+                "product_details": "1000 2x3 bopp gloss cmyk",
+                "_quantity_hint": 1000,
+                "business_name": "Acme",
+            },
+        )
+        r = handle_estimate_flow(
+            user_message="lol",
+            conversation_history=hist,
+            conversation_id="00000000-0000-4000-8000-000000000053",
+        )
+        self.assertTrue(r.handled)
+        assert r.assistant_meta is not None
+        self.assertEqual(r.assistant_meta["estimate_flow"]["pending_step_index"], 2)
+        self.assertIsNone(r.assistant_meta["estimate_flow"]["draft"].get("contact_name"))
+        self.assertIn("(again)", r.reply)
+
+    def test_step4_bad_email_stays(self) -> None:
+        hist = self._history_at_step(
+            3,
+            {
+                "product_details": "1000 2x3 bopp gloss cmyk",
+                "_quantity_hint": 1000,
+                "business_name": "Acme",
+                "contact_name": "Sam Jones",
+            },
+        )
+        r = handle_estimate_flow(
+            user_message="not-an-email",
+            conversation_history=hist,
+            conversation_id="00000000-0000-4000-8000-000000000054",
+        )
+        self.assertTrue(r.handled)
+        assert r.assistant_meta is not None
+        self.assertEqual(r.assistant_meta["estimate_flow"]["pending_step_index"], 3)
+        self.assertIsNone(r.assistant_meta["estimate_flow"]["draft"].get("email"))
+        self.assertIn("not-an-email", r.reply)
+        self.assertIn("(again)", r.reply)
+
+
 if __name__ == "__main__":
     unittest.main()

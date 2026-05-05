@@ -22,7 +22,7 @@ from fortis_cs_agent.tools import execute_agent_tool
 logger = logging.getLogger(__name__)
 
 # Bumped when changing estimate wizard behavior; exposed on GET /health for deploy verification.
-ESTIMATE_FLOW_BUILD = "wizard-v10-meta-chatter-user-message-split"
+ESTIMATE_FLOW_BUILD = "wizard-v11-step-field-validation"
 
 _STEPS = ("product_details", "business_name", "contact_name", "email", "address")
 _DEFAULT_NOTES = "This quote does not include shipping or taxes. Prices are valid for 30 days."
@@ -352,9 +352,172 @@ def _infer_snapshot_from_assistant_content(
     return None
 
 
+_EMAIL_SYNTAX_RE = re.compile(
+    r"^[a-zA-Z0-9][a-zA-Z0-9._%+\-]*@[a-zA-Z0-9][a-zA-Z0-9.\-]*\.[a-zA-Z]{2,}$"
+)
+
+# Whole-message patterns that are not usable legal / DBA business names.
+_GIBBERISH_OR_META_ANSWER_RE = re.compile(
+    r"(?i)^\s*("
+    r"wtf|lol|lmfao|rofl|idk|idc|bruh|meh|ugh|eh|huh|hmm+|nm|nvm|"
+    r"n/?a|none|null|nothing|no\s*$|nah|yep|yea|yeah|sure|maybe|ok+|k\.?|"
+    r"asdf+|qwerty|foo|bar|xxx+|abc123|1234|test\s*123|"
+    r"help|why|because|whatever|dunno|i\s*don'?t\s*know|guess|"
+    r"idk\??|wth|ffs|omg"
+    r")\s*[!?.]*\s*$"
+)
+
+# Contact name: obvious non-names (not exhaustive).
+_GIBBERISH_CONTACT_RE = re.compile(
+    r"(?i)^\s*("
+    r"wtf|lol|asdf|foo|bar|xxx|test|none|n/?a|idk|nobody|someone|anyone|meh|"
+    r"your\s+mom|admin|user|customer|sir|madam|dude|bro"
+    r")\s*[!?.]*\s*$"
+)
+
+
+def _safe_ack_snippet(text: str, *, max_len: int = 72) -> str:
+    """Short, safe excerpt of what the user typed for acknowledgments."""
+    t = re.sub(r"[\x00-\x1f\x7f]", "", (text or "").strip())
+    if not t:
+        return "that"
+    if len(t) > max_len:
+        return t[: max_len - 1] + "…"
+    return t
+
+
+def _business_name_field_issue(answer: str) -> str | None:
+    """
+    None = acceptable. Otherwise a short code: empty, short, no_letters, gibberish, numbers_only.
+    """
+    raw = (answer or "").strip()
+    if not raw:
+        return "empty"
+    low = raw.lower()
+    if low in {"individual", "personal", "consumer", "self"}:
+        return None
+    if len(raw) < 3:
+        return "short"
+    if not re.search(r"[a-zA-Z]", raw):
+        return "no_letters"
+    if sum(ch.isdigit() for ch in raw) >= len(raw) - 1 and any(ch.isdigit() for ch in raw):
+        return "numbers_only"
+    if _GIBBERISH_OR_META_ANSWER_RE.match(raw):
+        return "gibberish"
+    letters = [ch for ch in raw.lower() if ch.isalpha()]
+    if letters and len(set(letters)) == 1 and len(raw) <= 6:
+        return "gibberish"
+    return None
+
+
+def _contact_name_field_issue(answer: str) -> str | None:
+    """None = acceptable. Codes: empty, short, no_letters, gibberish, numbers_only."""
+    raw = (answer or "").strip()
+    if not raw:
+        return "empty"
+    if len(raw) < 2:
+        return "short"
+    if not re.search(r"[a-zA-Z]", raw):
+        return "no_letters"
+    if raw.isdigit():
+        return "numbers_only"
+    if _GIBBERISH_CONTACT_RE.match(raw):
+        return "gibberish"
+    return None
+
+
+def _address_field_issue(answer: str) -> str | None:
+    """None = ok. Codes: empty_not_skip, too_vague."""
+    a = (answer or "").strip()
+    if not a:
+        return "empty_not_skip"
+    low = a.lower()
+    if low in {"n/a", "na", "none", "same", "tbd"} and len(a) < 12:
+        return "too_vague"
+    if len(a) < 8 and not re.search(r"\d", a) and "po box" not in low:
+        return "too_vague"
+    return None
+
+
+def _invalid_business_name_reply(code: str, snippet: str) -> str:
+    ack = (
+        f"You sent **{snippet}** — "
+        if snippet and snippet != "that"
+        else ""
+    )
+    if code == "empty":
+        body = "I didn’t catch a **business name**. "
+    elif code == "short":
+        body = ack + "that’s a bit **too short** to print as the business on a quote. "
+    elif code == "no_letters":
+        body = ack + "I need at least some **letters** (a real company or brand name). "
+    elif code == "numbers_only":
+        body = ack + "a **business name** can’t be only numbers. "
+    else:
+        body = ack + "that doesn’t read like a **company or organization name**. "
+
+    return (
+        f"{body}"
+        "Please send the **legal name, DBA, or brand** that should appear on the quote—or reply **Individual** if it’s personal.\n\n"
+        "**Step 2/5 (again):** Which **business name** should we use on this paperwork?"
+    )
+
+
+def _invalid_contact_name_reply(code: str, snippet: str) -> str:
+    ack = f"You wrote **{snippet}** — " if snippet and snippet != "that" else ""
+    if code == "empty":
+        lead = "I need a **contact name** for this order. "
+    elif code == "short":
+        lead = ack + "please give at least **two characters** (a first name or full contact name). "
+    elif code == "no_letters":
+        lead = ack + "I need a **person’s name** (letters), not only numbers or symbols. "
+    elif code == "numbers_only":
+        lead = ack + "the **contact** should be a person’s name, not only digits. "
+    else:
+        lead = ack + "that doesn’t look like someone’s **name** (first + last is ideal). "
+
+    return (
+        f"{lead}"
+        "Who should we list as the day-to-day **contact**?\n\n"
+        "**Step 3/5 (again):** What’s the **contact’s full name**?"
+    )
+
+
+def _invalid_email_reply(snippet: str) -> str:
+    ack = f"I saw **{snippet}** — " if snippet and snippet != "that" else ""
+    return (
+        f"{ack}"
+        "that doesn’t look like a complete **email address** "
+        "(we need something in the form **someone@company.com** so we can send your quote link).\n\n"
+        "**Step 4/5 (again):** Which **email** should we use?"
+    )
+
+
+def _invalid_address_reply(snippet: str) -> str:
+    ack = f"You entered **{snippet}** — " if snippet and snippet != "that" else ""
+    return (
+        f"{ack}"
+        "I need a bit more to ship or bill: please send at least one line with **street, city, state/postal** "
+        "(or **P.O. Box** + city/state). If you truly don’t want to share an address yet, reply **skip**.\n\n"
+        "**Step 5/5 (again):** **Shipping/billing address** (one line), or **skip**."
+    )
+
+
 def _looks_like_email(s: str) -> bool:
     s = (s or "").strip()
-    return "@" in s and "." in s.split("@", 1)[-1]
+    if len(s) < 6 or "@" not in s:
+        return False
+    local, _, domain = s.partition("@")
+    if not local or not domain or "." not in domain:
+        return False
+    if len(local) > 64 or len(domain) > 255:
+        return False
+    dom_main, _, tld = domain.rpartition(".")
+    if len(tld) < 2 or not tld.isalpha():
+        return False
+    if ".." in s:
+        return False
+    return bool(_EMAIL_SYNTAX_RE.match(s))
 
 
 def _quote_absolute_url(estimate_id: str) -> str:
@@ -809,19 +972,45 @@ def handle_estimate_flow(
                     estimate_id=None,
                 )
     elif step_key == "business_name":
+        issue = _business_name_field_issue(answer)
+        if issue:
+            sn = _safe_ack_snippet(answer)
+            return EstimateFlowResult(
+                handled=True,
+                reply=_invalid_business_name_reply(issue, sn),
+                assistant_meta=_meta_payload(draft, pending_idx),
+            )
         draft["business_name"] = answer
     elif step_key == "contact_name":
+        issue = _contact_name_field_issue(answer)
+        if issue:
+            sn = _safe_ack_snippet(answer)
+            return EstimateFlowResult(
+                handled=True,
+                reply=_invalid_contact_name_reply(issue, sn),
+                assistant_meta=_meta_payload(draft, pending_idx),
+            )
         draft["contact_name"] = answer
     elif step_key == "email":
         if not _looks_like_email(answer):
             return EstimateFlowResult(
                 handled=True,
-                reply="That email doesn’t look complete — try **someone@yourcompany.com**.",
+                reply=_invalid_email_reply(_safe_ack_snippet(answer)),
                 assistant_meta=_meta_payload(draft, pending_idx),
             )
         draft["email"] = answer
     elif step_key == "address":
-        draft["address"] = "" if msg_lower == "skip" else answer
+        if msg_lower == "skip":
+            draft["address"] = ""
+        else:
+            a_issue = _address_field_issue(answer)
+            if a_issue:
+                return EstimateFlowResult(
+                    handled=True,
+                    reply=_invalid_address_reply(_safe_ack_snippet(answer)),
+                    assistant_meta=_meta_payload(draft, pending_idx),
+                )
+            draft["address"] = answer
     next_idx = pending_idx + 1
 
     if next_idx >= len(_STEPS):
