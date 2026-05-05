@@ -21,7 +21,7 @@ from fortis_cs_agent.tools import execute_agent_tool
 logger = logging.getLogger(__name__)
 
 # Bumped when changing estimate wizard behavior; exposed on GET /health for deploy verification.
-ESTIMATE_FLOW_BUILD = "wizard-v5-partial-step1-meta-fallback"
+ESTIMATE_FLOW_BUILD = "wizard-v6-history-recovery-labeled-forms"
 
 _STEPS = ("product_details", "business_name", "contact_name", "email", "address")
 _DEFAULT_NOTES = "This quote does not include shipping or taxes. Prices are valid for 30 days."
@@ -147,6 +147,148 @@ def _merge_step1_blob(prior: str, answer: str) -> str:
     return f"{p}; {a}"
 
 
+def _wizard_quote_finished_in_history(history_rows: list[dict[str, Any]]) -> bool:
+    for row in reversed(history_rows):
+        if row.get("role") != "assistant":
+            continue
+        c = row.get("content") or ""
+        if "### Pricing summary" in c or "Quick Ship** estimate has been saved" in c:
+            return True
+        meta = _coerce_meta_outer(row.get("meta"))
+        block = meta.get("estimate_flow")
+        if isinstance(block, dict) and block.get("completed") is True:
+            return True
+    return False
+
+
+def _first_pending_step_index(draft: dict[str, Any]) -> int:
+    blob = str(draft.get("product_details") or "").lower()
+    if not _step1_specs_complete(blob):
+        return 0
+    if not str(draft.get("business_name") or "").strip():
+        return 1
+    if not str(draft.get("contact_name") or "").strip():
+        return 2
+    if not str(draft.get("email") or "").strip():
+        return 3
+    if not str(draft.get("address") or "").strip():
+        return 4
+    return len(_STEPS)
+
+
+def _looks_like_labeled_estimate_form(text: str) -> bool:
+    return bool(
+        re.search(
+            r"(?i)(quantity|qty|material|finish|print\s*colors|colors|business\s*name|company|contact\s*name|\bcontact\b|email|shipping|address)\s*[:=]",
+            text,
+        )
+    )
+
+
+def _parse_labeled_estimate_to_draft(text: str) -> dict[str, Any]:
+    """Parse 'quantity: 500, material: ... business name: ...' style blobs into draft fields."""
+    out: dict[str, Any] = {}
+    t = text.strip()
+
+    def grab(rx: str) -> str | None:
+        m = re.search(rx, t, flags=re.IGNORECASE)
+        return m.group(1).strip().rstrip(" ,") if m else None
+
+    parts: list[str] = []
+    q = grab(r"(?:quantity|qty)\s*[:=]\s*(\d+)")
+    if q:
+        parts.append(f"{q} labels")
+    dim_m = re.search(r"(\d+\.?\d*)\s*[x×]\s*(\d+\.?\d*)", t.lower())
+    if dim_m:
+        parts.append(f"{dim_m.group(1)}x{dim_m.group(2)} in")
+    mat = grab(r"material\s*[:=]\s*([^,\n]+)")
+    if mat:
+        parts.append(mat)
+    fin = grab(r"finish\s*[:=]\s*([^,\n]+)")
+    if fin:
+        parts.append(fin)
+    pc = grab(r"print\s*colors\s*[:=]\s*([^,\n]+)") or grab(r"colors\s*[:=]\s*([^,\n]+)")
+    if pc:
+        parts.append(pc)
+    blob = "; ".join(p for p in parts if p)
+    if blob:
+        out["product_details"] = blob
+        q2 = _extract_quantity(blob.lower())
+        if q2:
+            out["_quantity_hint"] = q2
+
+    bn = grab(r"business\s*name\s*[:=]\s*([^,\n]+)") or grab(r"company\s*[:=]\s*([^,\n]+)")
+    if bn:
+        out["business_name"] = bn
+    cn = grab(r"contact\s*name\s*[:=]\s*([^,\n]+)")
+    if cn:
+        out["contact_name"] = cn
+    if not out.get("contact_name"):
+        c_alt = grab(r"(?<![\w])contact\s*[:=]\s*([^,\n]+)")
+        if c_alt and "@" not in c_alt:
+            out["contact_name"] = c_alt
+    em = grab(r"email\s*[:=]\s*(\S+@\S+)")
+    if em and _looks_like_email(em):
+        out["email"] = em
+    addr = grab(r"(?:shipping(?:/billing)?\s*address|billing\s*address)\s*[:=]\s*([^,\n]+)")
+    if not addr:
+        addr = grab(r"(?<![\w])address\s*[:=]\s*([^,\n]+)")
+    if addr:
+        out["address"] = addr
+    return out
+
+
+def _recover_snapshot_after_step1_prompt(
+    history_rows: list[dict[str, Any]],
+) -> tuple[dict[str, Any], int] | None:
+    """Rebuild draft when ``meta`` was lost but Step 1/5 ran and users replied (e.g. Grok interleaved)."""
+    if not history_rows or _wizard_quote_finished_in_history(history_rows):
+        return None
+    idx_step1: int | None = None
+    for i, row in enumerate(history_rows):
+        if row.get("role") == "assistant" and "Step 1/5" in (row.get("content") or ""):
+            idx_step1 = i
+    if idx_step1 is None:
+        return None
+    row = history_rows[idx_step1]
+    meta = _coerce_meta_outer(row.get("meta"))
+    block = meta.get("estimate_flow")
+    draft: dict[str, Any] = {}
+    if isinstance(block, dict):
+        d0 = block.get("draft")
+        if isinstance(d0, dict):
+            draft = dict(d0)
+    for urow in history_rows[idx_step1 + 1 :]:
+        if urow.get("role") != "user":
+            continue
+        u = (urow.get("content") or "").strip()
+        if not u:
+            continue
+        if _looks_like_labeled_estimate_form(u):
+            patches = _parse_labeled_estimate_to_draft(u)
+            for k, v in patches.items():
+                if v is None or (isinstance(v, str) and not v.strip()):
+                    continue
+                if k == "product_details" and draft.get("product_details"):
+                    draft["product_details"] = _merge_step1_blob(str(draft["product_details"]), str(v))
+                else:
+                    draft[k] = v
+        else:
+            prior = str(draft.get("product_details") or "").strip()
+            draft["product_details"] = _merge_step1_blob(prior, u)
+        low = str(draft.get("product_details") or "").lower()
+        qn = _extract_quantity(low)
+        if qn:
+            draft["_quantity_hint"] = qn
+    pending = _first_pending_step_index(draft)
+    logger.info(
+        "estimate_flow recovered draft from history after Step 1/5 (pending_step_index=%s keys=%s)",
+        pending,
+        list(draft.keys()),
+    )
+    return draft, pending
+
+
 def _infer_snapshot_from_assistant_content(
     history_rows: list[dict[str, Any]],
 ) -> tuple[dict[str, Any], int] | None:
@@ -234,6 +376,9 @@ def latest_estimate_flow_snapshot(history_rows: list[dict[str, Any]]) -> tuple[d
         idx = int(block.get("pending_step_index", 0))
         idx = max(0, min(idx, len(_STEPS) - 1))
         return draft, idx
+    rec = _recover_snapshot_after_step1_prompt(history_rows)
+    if rec is not None:
+        return rec
     return _infer_snapshot_from_assistant_content(history_rows)
 
 
@@ -430,6 +575,40 @@ def handle_estimate_flow(
         )
 
     if not carrying:
+        if req and _looks_like_labeled_estimate_form(raw):
+            labeled_draft = _parse_labeled_estimate_to_draft(raw)
+            if labeled_draft:
+                pi = _first_pending_step_index(labeled_draft)
+                if pi >= len(_STEPS):
+                    friendly, estimate_id = _persist_structured_estimate(
+                        conversation_id=conversation_id, draft=dict(labeled_draft)
+                    )
+                    return EstimateFlowResult(
+                        handled=True,
+                        reply=friendly or "",
+                        assistant_meta={"estimate_flow": {"active": False, "version": 1, "completed": True}},
+                        estimate_id=estimate_id,
+                    )
+                blob_low = str(labeled_draft.get("product_details") or "").lower()
+                if pi == 0 and not _step1_specs_complete(blob_low):
+                    miss_txt = ", ".join(_step1_missing_parts(blob_low))
+                    return EstimateFlowResult(
+                        handled=True,
+                        reply=(
+                            f"**Step 1/5:** I’ve captured: **{labeled_draft.get('product_details', '')}**\n\n"
+                            f"Still need: {miss_txt}.\n\n"
+                            "Send the missing pieces—you can add another line and I’ll combine."
+                        ),
+                        assistant_meta=_meta_payload(dict(labeled_draft), 0),
+                        estimate_id=None,
+                    )
+                return EstimateFlowResult(
+                    handled=True,
+                    reply=_prompt_for_pending_index(pi),
+                    assistant_meta=_meta_payload(dict(labeled_draft), pi),
+                    estimate_id=None,
+                )
+
         draft = {}
         rich = _extract_quantity(msg_lower) is not None and _extract_dimensions(msg_lower)
         if rich:
@@ -466,9 +645,18 @@ def handle_estimate_flow(
         )
 
     assert snap is not None
-    draft, pending_idx = snap
+    draft, _snap_pending = snap
     draft = dict(draft)
-    pending_idx = max(0, min(pending_idx, len(_STEPS) - 1))
+    fp0 = _first_pending_step_index(draft)
+    if fp0 >= len(_STEPS):
+        friendly, estimate_id = _persist_structured_estimate(conversation_id=conversation_id, draft=draft)
+        return EstimateFlowResult(
+            handled=True,
+            reply=friendly or "",
+            assistant_meta={"estimate_flow": {"active": False, "version": 1, "completed": True}},
+            estimate_id=estimate_id,
+        )
+    pending_idx = max(0, min(fp0, len(_STEPS) - 1))
 
     if pending_idx >= 1 and not str(draft.get("product_details") or "").strip():
         logger.warning(
@@ -495,25 +683,63 @@ def handle_estimate_flow(
     answer = raw.strip()
 
     if step_key == "product_details":
-        prior = str(draft.get("product_details") or "").strip()
-        merged = _merge_step1_blob(prior, answer)
-        draft["product_details"] = merged
-        low = merged.lower()
-        q = _extract_quantity(low)
-        if q:
-            draft["_quantity_hint"] = q
-        if not _step1_specs_complete(low):
-            miss_txt = ", ".join(_step1_missing_parts(low))
-            return EstimateFlowResult(
-                handled=True,
-                reply=(
-                    f"**Step 1/5:** Here’s what I have so far: **{merged}**\n\n"
-                    f"Still need: {miss_txt}.\n\n"
-                    "Add the rest in one line or another short line—I’ll keep combining."
-                ),
-                assistant_meta=_meta_payload(draft, pending_step_index=0),
-                estimate_id=None,
-            )
+        if _looks_like_labeled_estimate_form(raw):
+            patches = _parse_labeled_estimate_to_draft(raw)
+            merged_pd = str(draft.get("product_details") or "").strip()
+            for k, v in patches.items():
+                if v is None or (isinstance(v, str) and not str(v).strip()):
+                    continue
+                if k == "product_details":
+                    merged_pd = _merge_step1_blob(merged_pd, str(v))
+                else:
+                    draft[k] = v
+            if merged_pd:
+                draft["product_details"] = merged_pd
+            low = str(draft.get("product_details") or "").lower()
+            q = _extract_quantity(low)
+            if q:
+                draft["_quantity_hint"] = q
+            fp2 = _first_pending_step_index(draft)
+            if fp2 == 0 and not _step1_specs_complete(low):
+                miss_txt = ", ".join(_step1_missing_parts(low))
+                return EstimateFlowResult(
+                    handled=True,
+                    reply=(
+                        f"**Step 1/5:** Here’s what I have so far: **{draft['product_details']}**\n\n"
+                        f"Still need: {miss_txt}.\n\n"
+                        "Add the rest in one line or another short line—I’ll keep combining."
+                    ),
+                    assistant_meta=_meta_payload(draft, pending_step_index=0),
+                    estimate_id=None,
+                )
+            if fp2 > 0:
+                return EstimateFlowResult(
+                    handled=True,
+                    reply=_prompt_for_pending_index(fp2),
+                    assistant_meta=_meta_payload(draft, pending_step_index=fp2),
+                    estimate_id=None,
+                )
+            # fp2==0 and step 1 complete — fall through to next_idx below
+        else:
+            prior = str(draft.get("product_details") or "").strip()
+            merged = _merge_step1_blob(prior, answer)
+            draft["product_details"] = merged
+            low = merged.lower()
+            q = _extract_quantity(low)
+            if q:
+                draft["_quantity_hint"] = q
+            if not _step1_specs_complete(low):
+                miss_txt = ", ".join(_step1_missing_parts(low))
+                return EstimateFlowResult(
+                    handled=True,
+                    reply=(
+                        f"**Step 1/5:** Here’s what I have so far: **{merged}**\n\n"
+                        f"Still need: {miss_txt}.\n\n"
+                        "Add the rest in one line or another short line—I’ll keep combining."
+                    ),
+                    assistant_meta=_meta_payload(draft, pending_step_index=0),
+                    estimate_id=None,
+                )
     elif step_key == "business_name":
         draft["business_name"] = answer
     elif step_key == "contact_name":

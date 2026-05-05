@@ -182,6 +182,36 @@ class TestEstimateWizardFlow(unittest.TestCase):
         self.assertEqual(snap[1], 0)
         self.assertEqual(snap[0], {})
 
+    def test_recovery_after_grok_and_labeled_message(self) -> None:
+        """Rebuild draft from Step 1 + prior user WxH even when a Grok reply broke meta continuity."""
+        history = [
+            {
+                "role": "assistant",
+                "content": "**Step 1/5:** In one line send **quantity**, **size …**",
+                "meta": None,
+            },
+            {"role": "user", "content": "5x6"},
+            {
+                "role": "assistant",
+                "content": "It looks like you're providing dimensions—perhaps for a label quote?",
+                "meta": None,
+            },
+        ]
+        r = handle_estimate_flow(
+            user_message=(
+                "quantity: 500, material: white bopp, finish: gloss, print colors: cmyk, "
+                "business name: test_123"
+            ),
+            conversation_history=history,
+            conversation_id="00000000-0000-4000-8000-000000000020",
+        )
+        self.assertTrue(r.handled)
+        self.assertIn("Step 3/5", r.reply)
+        assert r.assistant_meta is not None
+        d = r.assistant_meta["estimate_flow"]["draft"]
+        self.assertEqual(d.get("business_name"), "test_123")
+        self.assertIn("5x6", d.get("product_details", ""))
+
 
 if __name__ == "__main__":
     unittest.main()
