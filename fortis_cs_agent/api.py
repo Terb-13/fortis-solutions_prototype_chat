@@ -427,6 +427,38 @@ async def _grok_chat(
     raise HTTPException(status_code=http_status, detail=outbound)
 
 
+def _should_skip_knowledge_retrieval(user_text: str) -> bool:
+    """Avoid RAG for meta/capability questions — training snippets look like real tickets and confuse the model."""
+    t = (user_text or "").strip().lower()
+    if not t:
+        return False
+    # Order #s, quantities, dates → shopper is being specific; allow retrieval.
+    if any(ch.isdigit() for ch in t):
+        return False
+    if len(t) > 72:
+        return False
+    if " about " in t:
+        return False
+    phrases = (
+        "what can you do",
+        "what can u do",
+        "what do you do",
+        "how can you help",
+        "what are you",
+        "who are you",
+        "what are your capabilities",
+        "your capabilities",
+        "how does this work",
+        "how do you work",
+        "what is this",
+    )
+    if any(p in t for p in phrases):
+        return True
+    if t in {"hi", "hello", "hey", "help"}:
+        return True
+    return False
+
+
 def _recent_user_text_for_pricing(prev: list[dict[str, Any]], user_text: str, *, max_prior: int = 6) -> str:
     """Merge recent user turns so size/qty/material from earlier messages still inform pricing lookup."""
     chunks: list[str] = []
@@ -585,16 +617,24 @@ async def run_agent_turn(
                 "Collect missing customer + address fields normally. Never invent dollars in prose."
             )
         else:
-            try:
-                knowledge_results = retrieve_knowledge(user_text, limit=4)
-            except Exception:
-                logger.exception("retrieve_knowledge failed; continuing without snippets.")
-                knowledge_results = []
-            knowledge_context = "\n\n".join([r["content"] for r in knowledge_results])
+            if _should_skip_knowledge_retrieval(user_text):
+                knowledge_context = ""
+            else:
+                try:
+                    knowledge_results = retrieve_knowledge(user_text, limit=4)
+                except Exception:
+                    logger.exception("retrieve_knowledge failed; continuing without snippets.")
+                    knowledge_results = []
+                knowledge_context = "\n\n".join([r["content"] for r in knowledge_results])
 
     augmented = user_text
     if knowledge_context:
-        augmented = "Internal knowledge:\n" + knowledge_context + "\n\nCustomer message:\n" + user_text
+        augmented = (
+            "Internal knowledge (reference only — not facts about this shopper unless they said it):\n"
+            + knowledge_context
+            + "\n\nCustomer message:\n"
+            + user_text
+        )
     msgs.append({"role": "user", "content": augmented})
 
     grok_msgs = [*msgs]
