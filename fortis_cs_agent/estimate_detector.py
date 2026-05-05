@@ -106,9 +106,14 @@ _STRICT_KEYWORD_RE = re.compile(
 _WIZARD_META_CHATTER_RE = re.compile(
     r"(?i)"
     r"\bare\s+you\s+(working|there|ok|awake|listening|broken|real)\b"
+    r"|\baren'?t\s+you\s+(working|listening|responding|there)\b"
+    r"|\bwhy\s+aren'?t\s+you\b"
+    r"|\bwhy\s+won'?t\s+you\b"
+    r"|\byou\s+(aren'?t|are\s+not)\s+(working|listening|responding)\b"
     r"|^\s*still\s+not\s*[.!?]?\s*$"
     r"|\bis\s+this\s+(working|broken|down)\b"
     r"|\bare\s+we\s+(good|live)\b"
+    r"|\b(you|this)\s+(broken|down)\b.*\?"
 )
 
 # Split AI/UI blobs that label the real user line (in addition to "Customer message:").
@@ -336,3 +341,45 @@ def should_skip_estimate_wizard_opener(message: str) -> bool:
     if _WIZARD_META_CHATTER_RE.search(t):
         return True
     return bool(_WIZARD_OPENER_HARD_BLOCK_RE.search(t))
+
+
+# Mid–quote-flow pivots: SBU / capability / frustration without the exact opener phrases.
+_WIZARD_TOPIC_PIVOT_RE = re.compile(
+    r"(?i)"
+    r"this\s+looks\s+good.{0,140}\bsbu\b"
+    r"|\bsbu\b.{0,100}\?"
+    r"|\btell\s+me\s+about\b.{0,100}\bsbu\b"
+    r"|\bcan\s+you\s+(explain|tell\s+me)\b.{0,100}\bsbu\b"
+    r"|\bwhat\s+(is|’s|'s)\s+.{0,30}\bsbu\b"
+    r"|\bsbu\b.{0,80}\b(mean|stand\s+for|about)\b"
+    r"|\bis\s+this\s+(a\s+)?(bot|chatgpt|ai)\b"
+    r"|\bare\s+you\s+(real|human|a\s+person)\b"
+)
+
+
+def should_exit_estimate_wizard_for_topic_shift(message: str) -> bool:
+    """
+    True when the shopper is clearly changing topic away from the Quick Ship wizard.
+
+    Used mid-flow to pause the wizard and let the chat model answer normally (no Step 1/5 reset).
+    """
+    t = shopper_utterance_for_estimate_heuristics(message)
+    if not t:
+        return False
+    if is_estimate_request(t):
+        return False
+    if _hard_block_quote_intent_override(t):
+        return False
+    if should_skip_estimate_wizard_opener(t):
+        return True
+    if _WIZARD_TOPIC_PIVOT_RE.search(t):
+        return True
+    return False
+
+
+def should_resume_estimate_wizard_from_paused(message: str) -> bool:
+    """True when a paused session should return to active quoting (explicit quote intent or strong product cue)."""
+    t = shopper_utterance_for_estimate_heuristics(message)
+    if not t:
+        return False
+    return bool(is_estimate_request(t) or _hard_block_quote_intent_override(t))

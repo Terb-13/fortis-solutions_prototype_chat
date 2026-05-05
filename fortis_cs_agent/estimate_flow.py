@@ -16,7 +16,13 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from fortis_cs_agent.estimate_detector import is_estimate_request, should_skip_estimate_wizard_opener, shopper_utterance_for_estimate_heuristics
+from fortis_cs_agent.estimate_detector import (
+    is_estimate_request,
+    should_exit_estimate_wizard_for_topic_shift,
+    should_resume_estimate_wizard_from_paused,
+    should_skip_estimate_wizard_opener,
+    shopper_utterance_for_estimate_heuristics,
+)
 from fortis_cs_agent.estimate_sessions import (
     EstimateSessionStatus,
     fetch_estimate_session,
@@ -29,7 +35,7 @@ from fortis_cs_agent.tools import execute_agent_tool
 logger = logging.getLogger(__name__)
 
 # Bumped when changing estimate wizard behavior; exposed on GET /health for deploy verification.
-ESTIMATE_FLOW_BUILD = "wizard-v13-supabase-sessions"
+ESTIMATE_FLOW_BUILD = "wizard-v14-topic-shift-no-echo"
 
 _STEPS = ("product_details", "business_name", "contact_name", "email", "address")
 _DEFAULT_NOTES = "This quote does not include shipping or taxes. Prices are valid for 30 days."
@@ -661,15 +667,25 @@ def latest_estimate_flow_snapshot(history_rows: list[dict[str, Any]]) -> tuple[d
     return _infer_snapshot_from_assistant_content(history_rows)
 
 
+def _step1_continue_reply(miss_txt: str) -> str:
+    """Step 1 partial progress without echoing the user’s prior line back to them."""
+    return (
+        f"**Step 1/5:** Thanks — I still need: {miss_txt}.\n\n"
+        "Send what’s missing in one line (or another short line if that’s easier—I’ll combine them)."
+    )
+
+
 def _resolve_wizard_snap(
     conversation_id: str,
     conversation_history: list[dict[str, Any]],
     session_row: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], int] | None:
-    """Prefer Supabase wizard session when active; else assistant meta / history snapshot."""
+    """Prefer Supabase session when ``in_progress``. ``paused`` does not re-attach the wizard from DB."""
     if session_row is None:
         session_row = fetch_estimate_session(conversation_id)
-    if session_row and session_row.get("status") in ("in_progress", "paused"):
+    if session_row and session_row.get("status") == "paused":
+        return None
+    if session_row and session_row.get("status") == "in_progress":
         cd = session_row.get("collected_data") or {}
         if not isinstance(cd, dict):
             cd = {}
@@ -883,14 +899,11 @@ def sync_wizard_session_from_result(*, conversation_id: str, result: EstimateFlo
 
 
 def maybe_pause_wizard_session_on_topic_shift(conversation_id: str, user_message: str) -> None:
-    """If the shopper veers off (capability / meta) mid-wizard, pause without dropping collected data."""
-    raw = _normalize_user_line_for_wizard(shopper_utterance_for_estimate_heuristics(user_message))
-    if not raw:
-        return
+    """If the shopper veers off (capability / SBU / frustration) mid-wizard, pause without losing data."""
     row = fetch_estimate_session(conversation_id)
     if not row or row.get("status") != "in_progress":
         return
-    if should_skip_estimate_wizard_opener(raw) and not is_estimate_request(raw):
+    if should_exit_estimate_wizard_for_topic_shift(user_message):
         update_estimate_session_status(conversation_id, "paused")
 
 
@@ -908,11 +921,13 @@ def handle_estimate_flow(
 
     session_row = fetch_estimate_session(conversation_id)
     if session_row and session_row.get("status") == "in_progress":
-        if should_skip_estimate_wizard_opener(raw) and not is_estimate_request(raw):
+        if should_exit_estimate_wizard_for_topic_shift(user_message):
             update_estimate_session_status(conversation_id, "paused")
             return EstimateFlowResult(handled=False)
     if session_row and session_row.get("status") == "paused":
-        if should_skip_estimate_wizard_opener(raw) and not is_estimate_request(raw):
+        if should_exit_estimate_wizard_for_topic_shift(user_message):
+            return EstimateFlowResult(handled=False)
+        if not should_resume_estimate_wizard_from_paused(user_message):
             return EstimateFlowResult(handled=False)
         update_estimate_session_status(conversation_id, "in_progress")
         session_row = fetch_estimate_session(conversation_id)
@@ -930,6 +945,12 @@ def handle_estimate_flow(
         return EstimateFlowResult(handled=False)
 
     msg_lower = raw.lower()
+
+    if carrying and should_exit_estimate_wizard_for_topic_shift(user_message):
+        row = fetch_estimate_session(conversation_id)
+        if row and row.get("status") == "in_progress":
+            update_estimate_session_status(conversation_id, "paused")
+        return EstimateFlowResult(handled=False)
 
     # Never treat keyword "quote" inside answers (e.g. company names) as a reason to reset the wizard.
     if carrying and _RESTART_FLOW_RE.search(raw):
@@ -960,11 +981,7 @@ def handle_estimate_flow(
                     miss_txt = ", ".join(_step1_missing_parts(blob_low))
                     return EstimateFlowResult(
                         handled=True,
-                        reply=(
-                            f"**Step 1/5:** I’ve captured: **{labeled_draft.get('product_details', '')}**\n\n"
-                            f"Still need: {miss_txt}.\n\n"
-                            "Send the missing pieces—you can add another line and I’ll combine."
-                        ),
+                        reply=_step1_continue_reply(miss_txt),
                         assistant_meta=_meta_payload(dict(labeled_draft), 0),
                         estimate_id=None,
                     )
@@ -993,11 +1010,7 @@ def handle_estimate_flow(
             miss_txt = ", ".join(_step1_missing_parts(msg_lower))
             return EstimateFlowResult(
                 handled=True,
-                reply=(
-                    f"**Step 1/5:** I’ve captured: **{raw}**\n\n"
-                    f"Still need: {miss_txt}.\n\n"
-                    "Send the missing pieces in another line if that’s easier—I’ll combine them."
-                ),
+                reply=_step1_continue_reply(miss_txt),
                 assistant_meta=_meta_payload(draft, pending_step_index=0),
                 estimate_id=None,
             )
@@ -1013,11 +1026,7 @@ def handle_estimate_flow(
                 miss_txt = ", ".join(_step1_missing_parts(msg_lower))
                 return EstimateFlowResult(
                     handled=True,
-                    reply=(
-                        f"**Step 1/5:** I’ve captured: **{raw}**\n\n"
-                        f"Still need: {miss_txt}.\n\n"
-                        "Send the missing pieces in another line if that’s easier—I’ll combine them."
-                    ),
+                    reply=_step1_continue_reply(miss_txt),
                     assistant_meta=_meta_payload(draft, pending_step_index=0),
                     estimate_id=None,
                 )
@@ -1092,11 +1101,7 @@ def handle_estimate_flow(
                 miss_txt = ", ".join(_step1_missing_parts(low))
                 return EstimateFlowResult(
                     handled=True,
-                    reply=(
-                        f"**Step 1/5:** Here’s what I have so far: **{draft['product_details']}**\n\n"
-                        f"Still need: {miss_txt}.\n\n"
-                        "Add the rest in one line or another short line—I’ll keep combining."
-                    ),
+                    reply=_step1_continue_reply(miss_txt),
                     assistant_meta=_meta_payload(draft, pending_step_index=0),
                     estimate_id=None,
                 )
@@ -1120,11 +1125,7 @@ def handle_estimate_flow(
                 miss_txt = ", ".join(_step1_missing_parts(low))
                 return EstimateFlowResult(
                     handled=True,
-                    reply=(
-                        f"**Step 1/5:** Here’s what I have so far: **{merged}**\n\n"
-                        f"Still need: {miss_txt}.\n\n"
-                        "Add the rest in one line or another short line—I’ll keep combining."
-                    ),
+                    reply=_step1_continue_reply(miss_txt),
                     assistant_meta=_meta_payload(draft, pending_step_index=0),
                     estimate_id=None,
                 )

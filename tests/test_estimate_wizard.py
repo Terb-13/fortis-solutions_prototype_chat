@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import unittest
 
-from fortis_cs_agent.estimate_detector import is_estimate_request, should_skip_estimate_wizard_opener
+from unittest.mock import patch
+
+from fortis_cs_agent.estimate_detector import (
+    is_estimate_request,
+    should_exit_estimate_wizard_for_topic_shift,
+    should_resume_estimate_wizard_from_paused,
+    should_skip_estimate_wizard_opener,
+)
 from fortis_cs_agent.estimate_flow import handle_estimate_flow
 
 
@@ -55,7 +62,10 @@ class TestWrappedCustomerMessageBlob(unittest.TestCase):
         )
         self.assertTrue(r.handled)
         self.assertNotIn("Got it — I’ll collect a structured Quick Ship estimate", r.reply)
-        self.assertIn("I’ve captured", r.reply)
+        self.assertIn("Step 1/5", r.reply)
+        self.assertIn("I still need", r.reply)
+        self.assertNotIn("I’ve captured", r.reply)
+        self.assertNotIn("5x6, 5000", r.reply)
 
     def test_user_message_marker_and_meta_chatter(self) -> None:
         blob = (
@@ -166,6 +176,53 @@ class TestFullThreadProxyBlob(unittest.TestCase):
         self.assertEqual(r.assistant_meta["estimate_flow"]["pending_step_index"], 2)
         self.assertEqual(r.assistant_meta["estimate_flow"]["draft"].get("business_name"), "lloydco")
         self.assertIn("Step 3/5", r.reply)
+
+
+class TestWizardTopicShift(unittest.TestCase):
+    """Mid–quote-flow SBU / capability questions should pause the session, not advance the wizard."""
+
+    @patch("fortis_cs_agent.estimate_flow.update_estimate_session_status")
+    @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session")
+    def test_sbu_pivot_pauses_in_progress_session(self, mock_fetch, mock_update) -> None:
+        mock_fetch.return_value = {
+            "status": "in_progress",
+            "collected_data": {
+                "product_details": "5000 2x3 white bopp gloss cmyk",
+                "quantity": 5000,
+                "business_name": None,
+                "contact_name": None,
+                "email": None,
+                "address": None,
+            },
+        }
+        r = handle_estimate_flow(
+            user_message="This looks good. Can you tell me about the SBU?",
+            conversation_history=[],
+            conversation_id="00000000-0000-4000-8000-000000000070",
+        )
+        self.assertFalse(r.handled)
+        mock_update.assert_called_with("00000000-0000-4000-8000-000000000070", "paused")
+
+    @patch("fortis_cs_agent.estimate_flow.update_estimate_session_status")
+    @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session")
+    def test_why_arent_you_working_pauses(self, mock_fetch, mock_update) -> None:
+        mock_fetch.return_value = {
+            "status": "in_progress",
+            "collected_data": {"product_details": "5000 2x3 white bopp gloss cmyk", "quantity": 5000},
+        }
+        r = handle_estimate_flow(
+            user_message="Why aren't you working?!",
+            conversation_history=[],
+            conversation_id="00000000-0000-4000-8000-000000000071",
+        )
+        self.assertFalse(r.handled)
+        mock_update.assert_called()
+
+    def test_topic_shift_heuristic_detects_sbu_and_not_resume_on_company_name(self) -> None:
+        self.assertTrue(should_exit_estimate_wizard_for_topic_shift("tell me about the sbu"))
+        self.assertTrue(should_exit_estimate_wizard_for_topic_shift("what can you do?"))
+        self.assertFalse(should_resume_estimate_wizard_from_paused("lloydco"))
+        self.assertTrue(should_resume_estimate_wizard_from_paused("I need a quote for labels"))
 
 
 class TestCollectedDataMapping(unittest.TestCase):
@@ -335,7 +392,7 @@ class TestEstimateWizardFlow(unittest.TestCase):
             conversation_id="00000000-0000-4000-8000-000000000010",
         )
         self.assertTrue(r.handled)
-        self.assertIn("Still need", r.reply)
+        self.assertIn("I still need", r.reply)
         assert r.assistant_meta is not None
         self.assertEqual(r.assistant_meta["estimate_flow"]["pending_step_index"], 0)
         self.assertIn("2x3", r.assistant_meta["estimate_flow"]["draft"]["product_details"])
