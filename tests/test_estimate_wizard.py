@@ -32,6 +32,16 @@ class TestEstimateDetector(unittest.TestCase):
         self.assertFalse(is_estimate_request("is that all you do?"))
         self.assertFalse(is_estimate_request("what else can you help with?"))
         self.assertFalse(is_estimate_request("how can you help?"))
+        self.assertFalse(is_estimate_request("Hi, what can you do?"))
+        self.assertFalse(is_estimate_request("Hey — what can you do?"))
+
+    def test_explicit_refusal_and_sbu_not_estimate_intent(self) -> None:
+        self.assertFalse(is_estimate_request("I don't want an estimate."))
+        self.assertFalse(
+            is_estimate_request("I don't want an estimate. I'd like to know about the sbu")
+        )
+        self.assertFalse(is_estimate_request("just asking about your company"))
+        self.assertTrue(is_estimate_request("just asking about pricing for 2x3 labels"))
 
     def test_quote_phrases_after_capability_still_intent(self) -> None:
         self.assertTrue(is_estimate_request("what can you do for a quote?"))
@@ -226,6 +236,19 @@ class TestEstimateWizardFlow(unittest.TestCase):
         d = r.assistant_meta["estimate_flow"]["draft"]
         self.assertEqual(d.get("business_name"), "test_123")
         self.assertIn("5x6", d.get("product_details", ""))
+
+    def test_non_estimate_phrases_skip_wizard(self) -> None:
+        for msg in (
+            "what can you do?",
+            "Hi, what can you do?",
+            "I don't want an estimate. I'd like to know about the sbu",
+        ):
+            r = handle_estimate_flow(
+                user_message=msg,
+                conversation_history=[],
+                conversation_id="00000000-0000-4000-8000-000000000030",
+            )
+            self.assertFalse(r.handled, msg=repr(msg))
 
 
 if __name__ == "__main__":
