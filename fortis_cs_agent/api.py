@@ -73,6 +73,25 @@ def _sb() -> Any:
     return supabase
 
 
+def _supabase_jwt_role_hint() -> str | None:
+    """Decode JWT ``role`` claim (no secrets logged) to catch anon key mis-configured as service key."""
+    key = (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+    if not key or key.count(".") < 2:
+        return None
+    try:
+        import base64
+        import json
+
+        body = key.split(".")[1]
+        pad = "=" * (-len(body) % 4)
+        raw = base64.urlsafe_b64decode(body + pad)
+        data = json.loads(raw.decode("utf-8"))
+        r = data.get("role")
+        return str(r) if r else None
+    except Exception:
+        return "unreadable_jwt"
+
+
 def _normalize_conversation_id(existing_id: str | None) -> str:
     """Return a UUID string for this thread: reuse client id when valid, else allocate new."""
     raw = (existing_id or "").strip()
@@ -280,6 +299,13 @@ def append_message(
             payload["meta"] = meta
         client.table(MSG_TABLE).insert(payload).execute()
     except Exception as exc:
+        err_text = (getattr(exc, "message", None) or str(exc)).lower()
+        if "row-level security" in err_text or "42501" in err_text:
+            logger.error(
+                "append_message RLS denial: set SUPABASE_SERVICE_ROLE_KEY to the **service_role** JWT "
+                "(Supabase Project Settings → API), not the anon key. GET /health supabase_jwt_role should be "
+                "service_role."
+            )
         logger.exception(
             "append_message FAILED table=%s conversation_id=%s role=%s tool_name=%s "
             "exc_type=%s message=%s payload_preview_keys=%s",
@@ -693,6 +719,7 @@ async def health() -> dict[str, Any]:
         "grok_model": XAI_CHAT_MODEL,
         "grok_fallback_model": XAI_CHAT_MODEL_FALLBACK or None,
         "supabase_configured": supabase is not None,
+        "supabase_jwt_role": _supabase_jwt_role_hint(),
         "pricing_health": pricing_health_probe(),
         "estimate_flow_build": _estimate_flow.ESTIMATE_FLOW_BUILD,
         "vercel_git_commit_sha": (os.getenv("VERCEL_GIT_COMMIT_SHA") or "").strip() or None,

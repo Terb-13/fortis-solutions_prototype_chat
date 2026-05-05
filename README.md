@@ -96,6 +96,10 @@ create table if not exists fortis_knowledge_chunks (
 
 Row Level Security: lock these down to service role or add policies for your app; the backend uses the **service role** key server-side only.
 
+**`/chat` returns 200 but messages never save (wizard “resets”)** — check Vercel logs for `append_message ... row-level security`. That almost always means **`SUPABASE_SERVICE_ROLE_KEY` is set to the anon key**. Use the **service_role** secret (Project Settings → API). **`GET /health`** includes `supabase_jwt_role`; it must be **`service_role`**, not `anon`.
+
+If you intentionally use RLS with the anon key in other clients, still configure the **Python API** with the service role key so server-side inserts bypass RLS.
+
 ### Legacy table missing `channel` (PostgREST `PGRST204`)
 
 If your project already had `fortis_conversations` **without** `channel` / `channel_ref`, `CREATE TABLE IF NOT EXISTS` above does nothing and `/chat` will fail with **`Could not find the 'channel' column`**. Apply the additive migration **`sql/fix_fortis_conversations_chat_columns.sql`** in the Supabase SQL editor, wait a few seconds for the API schema cache to refresh (or redeploy).

@@ -22,6 +22,10 @@ class TestEstimateDetector(unittest.TestCase):
         self.assertFalse(is_estimate_request("hello"))
         self.assertFalse(is_estimate_request("what are your hours?"))
 
+    def test_rhetorical_estimate_mention_not_intent(self) -> None:
+        self.assertFalse(is_estimate_request("is all you can do is estimate?"))
+        self.assertFalse(is_estimate_request("do you only do estimates?"))
+
 
 class TestEstimateWizardFlow(unittest.TestCase):
     def test_opener_starts_step_1(self) -> None:

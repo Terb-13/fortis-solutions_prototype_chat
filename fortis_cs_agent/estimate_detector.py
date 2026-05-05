@@ -12,6 +12,18 @@ _LABEL_QTY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Rhetorical / capability questions — mention “estimate” but are not a quote request.
+_ESTIMATE_NON_REQUEST_RE = re.compile(
+    r"(?i)"
+    r"(is\s+(that\s+)?(it|this|all)\s+)?(you\s+)?(can|could)\s+(you\s+)?(only|just)\s+.*\bestimate|"
+    r"\b(is\s+)?all\s+you\s+can\s+do\b.*\bestimate|"
+    r"\b(do|does)\s+you\s+only\b.*\bestimate|"
+    r"\bnothing\s+(else|more)\b.*\bestimate|"
+    r"\bnot\s+just\s+.*\bestimate|"
+    r"\bbesides\b.*\bestimate\b.*\b(what|who|how|else)|"
+    r"\bwhat\s+else\b.*\bestimate\b"
+)
+
 
 def is_estimate_request(message: str) -> bool:
     """
@@ -21,6 +33,9 @@ def is_estimate_request(message: str) -> bool:
     """
     text = (message or "").strip()
     if not text:
+        return False
+
+    if _ESTIMATE_NON_REQUEST_RE.search(text):
         return False
 
     keywords = [
