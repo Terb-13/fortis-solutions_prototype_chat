@@ -630,9 +630,13 @@ async def run_agent_turn(
     augmented = user_text
     if knowledge_context:
         augmented = (
-            "Internal knowledge (reference only — not facts about this shopper unless they said it):\n"
+            "Internal knowledge below is CONFIDENTIAL reference for you only. It may contain other "
+            "customers’ or sample scenarios. Do NOT quote PO/lot/order numbers, names, companies, emails, "
+            "phones, or addresses from it. Use it only for generic Fortis guidance. The shopper’s words "
+            "are only in “Customer message”.\n\n"
+            "--- internal reference ---\n"
             + knowledge_context
-            + "\n\nCustomer message:\n"
+            + "\n--- end internal reference ---\n\nCustomer message:\n"
             + user_text
         )
     msgs.append({"role": "user", "content": augmented})
