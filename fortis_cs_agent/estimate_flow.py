@@ -15,14 +15,21 @@ from typing import Any
 
 from fortis_cs_agent.estimate_detector import is_estimate_request
 from fortis_cs_agent.knowledge import retrieve_pricing
+from fortis_cs_agent.tools import execute_agent_tool
 
 logger = logging.getLogger(__name__)
 
 # Bumped when changing estimate wizard behavior; exposed on GET /health for deploy verification.
-ESTIMATE_FLOW_BUILD = "wizard-v3-quote-summary-ui"
+ESTIMATE_FLOW_BUILD = "wizard-v4-restart-and-detector"
 
 _STEPS = ("product_details", "business_name", "contact_name", "email", "address")
 _DEFAULT_NOTES = "This quote does not include shipping or taxes. Prices are valid for 30 days."
+
+_RESTART_FLOW_RE = re.compile(
+    r"\b(?:start\s+over|restart|begin\s+again|new\s+(?:quote|estimate)|"
+    r"another\s+(?:quote|estimate)|different\s+(?:quote|estimate)|cancel\s+(?:the\s+)?(?:quote|estimate))\b",
+    re.IGNORECASE,
+)
 
 
 def _qty_to_cost_key(qty: int) -> str:
@@ -230,24 +237,33 @@ def _persist_structured_estimate(
         }
     ]
 
-    from fortis_cs_agent.tools import insert_fortis_estimate
-
     try:
-        result = insert_fortis_estimate(
-            conversation_id,
-            str(draft.get("business_name") or ""),
-            str(draft.get("contact_name") or ""),
-            str(draft.get("email") or ""),
-            "",
-            str(draft.get("address") or ""),
-            items,
-            _DEFAULT_NOTES,
+        out = execute_agent_tool(
+            "create_estimate",
+            {
+                "business_name": str(draft.get("business_name") or ""),
+                "contact_name": str(draft.get("contact_name") or ""),
+                "email": str(draft.get("email") or ""),
+                "phone": "",
+                "address": str(draft.get("address") or ""),
+                "items": items,
+                "notes": _DEFAULT_NOTES,
+            },
+            persist_estimate=True,
+            conversation_id=conversation_id,
         )
     except Exception:
-        logger.exception("estimate_flow insert failed cid=%s", conversation_id)
+        logger.exception("estimate_flow create_estimate failed cid=%s", conversation_id)
         return ("Estimate save failed on our side — try again shortly.", None)
 
-    eid = str(result.get("estimate_id", "") or "").strip()
+    if isinstance(out, dict) and out.get("error"):
+        hint = str(out.get("message") or out.get("hint") or "unknown error")[:500]
+        logger.warning("estimate_flow create_estimate tool error cid=%s detail=%s", conversation_id, hint)
+        return (f"Estimate save failed — {hint}", None)
+
+    eid = str((out or {}).get("estimate_id", "") or "").strip()
+    if not eid:
+        return ("Estimate save failed — no estimate id returned.", None)
     link = _quote_absolute_url(eid)
     mat = str(row.get("material") or "").strip()
     fin = str(row.get("finish") or "").strip()
@@ -318,9 +334,14 @@ def handle_estimate_flow(
 
     msg_lower = raw.lower()
 
-    if req and carrying:
-        snap = None
-        carrying = False
+    # Never treat keyword "quote" inside answers (e.g. company names) as a reason to reset the wizard.
+    if carrying and _RESTART_FLOW_RE.search(raw):
+        return EstimateFlowResult(
+            handled=True,
+            reply=_prompt_for_pending_index(0),
+            assistant_meta=_meta_payload({}, pending_step_index=0),
+            estimate_id=None,
+        )
 
     if not carrying:
         draft: dict[str, Any] = {}
