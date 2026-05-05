@@ -26,6 +26,17 @@ class TestEstimateDetector(unittest.TestCase):
         self.assertFalse(is_estimate_request("is all you can do is estimate?"))
         self.assertFalse(is_estimate_request("do you only do estimates?"))
 
+    def test_capability_questions_not_estimate_intent(self) -> None:
+        self.assertFalse(is_estimate_request("what can you do?"))
+        self.assertFalse(is_estimate_request("What can you do"))
+        self.assertFalse(is_estimate_request("is that all you do?"))
+        self.assertFalse(is_estimate_request("what else can you help with?"))
+        self.assertFalse(is_estimate_request("how can you help?"))
+
+    def test_quote_phrases_after_capability_still_intent(self) -> None:
+        self.assertTrue(is_estimate_request("what can you do for a quote?"))
+        self.assertTrue(is_estimate_request("what can you do to get me pricing?"))
+
 
 class TestEstimateWizardFlow(unittest.TestCase):
     def test_opener_starts_step_1(self) -> None:
