@@ -747,7 +747,7 @@ async def estimate_pdf_download(estimate_id: str) -> StreamingResponse:
 
 
 @router.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest) -> ChatResponse:
+async def chat(req: ChatRequest, res: Response) -> ChatResponse:
     cid, persist = allocate_web_chat_conversation(req.conversation_id)
 
     history = load_recent_messages(cid) if persist else []
@@ -780,6 +780,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
     if persist:
         append_message(cid, role="user", content=req.message)
         append_message(cid, role="assistant", content=reply, meta=assistant_meta)
+    res.headers["X-Estimate-Flow-Build"] = _estimate_flow.ESTIMATE_FLOW_BUILD
     return ChatResponse(reply=reply, conversation_id=cid, estimate_id=estimate_id)
 
 

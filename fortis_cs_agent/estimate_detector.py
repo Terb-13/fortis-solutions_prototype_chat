@@ -102,7 +102,19 @@ _STRICT_KEYWORD_RE = re.compile(
     r"|\bquick\s+ship\b"
 )
 
-# Opening-turn hard block: never start the wizard on these (server + model guardrails).
+# Connectivity / frustration lines — not quote requests (override can still allow mixed intent).
+_WIZARD_META_CHATTER_RE = re.compile(
+    r"(?i)"
+    r"\bare\s+you\s+(working|there|ok|awake|listening|broken|real)\b"
+    r"|^\s*still\s+not\s*[.!?]?\s*$"
+    r"|\bis\s+this\s+(working|broken|down)\b"
+    r"|\bare\s+we\s+(good|live)\b"
+)
+
+# Split AI/UI blobs that label the real user line (in addition to "Customer message:").
+_SHOPPER_LINE_SPLIT_RE = re.compile(
+    r"(?i)\b(?:customer|user|shopper|client)\s+message\s*:\s*",
+)
 # Substrings, not ^-anchored, so leading greetings still match.
 _WIZARD_OPENER_HARD_BLOCK_RE = re.compile(
     r"(?i)"
@@ -204,6 +216,9 @@ def is_estimate_request(message: str) -> bool:
     if not text:
         return False
 
+    if _WIZARD_META_CHATTER_RE.search(text) and not _hard_block_quote_intent_override(text):
+        return False
+
     if _STRONG_QUOTE_INTENT_RE.search(text):
         return True
     if _LABEL_QTY_RE.search(text):
@@ -238,19 +253,19 @@ def shopper_utterance_for_estimate_heuristics(message: str) -> str:
     """
     Use the real shopper line when a proxy forwards an augmented blob.
 
-    Model/RAG wrappers often end with ``Customer message:`` + the user’s words; scanning the
-    whole blob falsely matches training words like “quote” / “pricing” and starts the wizard.
+    Model/RAG wrappers often end with ``Customer message:`` / ``User message:`` + the user’s words;
+    scanning the whole blob falsely matches training words like “quote” / “pricing” and starts the wizard.
     """
     t = (message or "").strip()
     if not t:
         return ""
     t = re.sub(r"[\u200b-\u200d\ufeff]", "", t)
     t = t.replace("\u00a0", " ")
-    parts = re.split(r"(?i)\bcustomer\s+message\s*:\s*", t)
+    parts = _SHOPPER_LINE_SPLIT_RE.split(t)
     if len(parts) >= 2:
         core = parts[-1].strip()
         if core:
-            return core
+            t = core
     return t.strip()
 
 
@@ -265,4 +280,6 @@ def should_skip_estimate_wizard_opener(message: str) -> bool:
         return False
     if _hard_block_quote_intent_override(t):
         return False
+    if _WIZARD_META_CHATTER_RE.search(t):
+        return True
     return bool(_WIZARD_OPENER_HARD_BLOCK_RE.search(t))

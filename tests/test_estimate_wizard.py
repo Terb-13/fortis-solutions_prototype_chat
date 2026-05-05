@@ -57,6 +57,31 @@ class TestWrappedCustomerMessageBlob(unittest.TestCase):
         self.assertNotIn("Got it — I’ll collect a structured Quick Ship estimate", r.reply)
         self.assertIn("I’ve captured", r.reply)
 
+    def test_user_message_marker_and_meta_chatter(self) -> None:
+        blob = (
+            "Quick Ship quotes and pricing context.\n\n"
+            "User message:\n"
+            "are you working now?"
+        )
+        self.assertFalse(is_estimate_request(blob))
+        self.assertTrue(should_skip_estimate_wizard_opener(blob))
+        r = handle_estimate_flow(
+            user_message=blob,
+            conversation_history=[],
+            conversation_id="00000000-0000-4000-8000-000000000043",
+        )
+        self.assertFalse(r.handled)
+
+    def test_still_not_alone_skips_wizard(self) -> None:
+        self.assertTrue(should_skip_estimate_wizard_opener("still not"))
+        self.assertFalse(
+            handle_estimate_flow(
+                user_message="still not",
+                conversation_history=[],
+                conversation_id="00000000-0000-4000-8000-000000000044",
+            ).handled
+        )
+
 
 class TestShouldSkipWizardOpener(unittest.TestCase):
     def test_blocks_meta_and_refusals(self) -> None:
