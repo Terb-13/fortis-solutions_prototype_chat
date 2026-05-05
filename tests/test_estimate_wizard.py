@@ -34,6 +34,29 @@ class TestWrappedCustomerMessageBlob(unittest.TestCase):
         )
         self.assertFalse(r.handled)
 
+    def test_chatter_does_not_open_wizard_when_blob_has_quote_keywords(self) -> None:
+        """Regression: training prefix must not force cold opener without explicit quote phrase."""
+        r = handle_estimate_flow(
+            user_message=(
+                "We offer Quick Ship quotes and label pricing.\n\n"
+                "Customer message:\nare you broken?"
+            ),
+            conversation_history=[],
+            conversation_id="00000000-0000-4000-8000-000000000041",
+        )
+        self.assertFalse(r.handled)
+
+    def test_specs_partial_step1_even_if_qty_dim_strict_fails(self) -> None:
+        """Product-ish line should capture partial Step 1, not repeat full Got it opener."""
+        r = handle_estimate_flow(
+            user_message="5x6, 5000, white bopp, cmyk",
+            conversation_history=[],
+            conversation_id="00000000-0000-4000-8000-000000000042",
+        )
+        self.assertTrue(r.handled)
+        self.assertNotIn("Got it — I’ll collect a structured Quick Ship estimate", r.reply)
+        self.assertIn("I’ve captured", r.reply)
+
 
 class TestShouldSkipWizardOpener(unittest.TestCase):
     def test_blocks_meta_and_refusals(self) -> None:

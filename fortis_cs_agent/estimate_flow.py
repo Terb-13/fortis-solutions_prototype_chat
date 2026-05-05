@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import unicodedata
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -21,7 +22,7 @@ from fortis_cs_agent.tools import execute_agent_tool
 logger = logging.getLogger(__name__)
 
 # Bumped when changing estimate wizard behavior; exposed on GET /health for deploy verification.
-ESTIMATE_FLOW_BUILD = "wizard-v8-customer-message-extract"
+ESTIMATE_FLOW_BUILD = "wizard-v9-cold-opener-guard"
 
 _STEPS = ("product_details", "business_name", "contact_name", "email", "address")
 _DEFAULT_NOTES = "This quote does not include shipping or taxes. Prices are valid for 30 days."
@@ -30,6 +31,17 @@ _RESTART_FLOW_RE = re.compile(
     r"\b(?:start\s+over|restart|begin\s+again|new\s+(?:quote|estimate)|"
     r"another\s+(?:quote|estimate)|different\s+(?:quote|estimate)|cancel\s+(?:the\s+)?(?:quote|estimate))\b",
     re.IGNORECASE,
+)
+
+# Cold “Got it — Step 1/5” intro only when language clearly asks for pricing (and not blocked by should_skip).
+_EXPLICIT_QUOTE_COLD_OPENER_RE = re.compile(
+    r"(?i)"
+    r"\bpricing\b|\bprices?\b|\bhow\s+much\b"
+    r"|\bcreate\b.{0,24}\bestimates?\b|\bquick\s+ship\b"
+    r"|\bcan\s+you\s+quote\b|\b(get|need)\s+(an?\s+)?(quote|estimate|price)\b"
+    r"|\bfor\s+a\s+quote\b|\bballpark\b|\bprice\s+quote\b"
+    r"|(?<!\bdont\s)(?<!\bdon't\s)\bwant\s+(?:an?\s+)?(?:quote|estimate)\b"
+    r"|\b(?:give|send)\s+(?:me\s+)?(?:an?\s+)?(?:quote|estimate|price)\b"
 )
 
 
@@ -77,11 +89,37 @@ def _extract_quantity(text_lower: str) -> int | None:
 def _extract_dimensions(text_lower: str) -> bool:
     return (
         re.search(
-            r"(\d+(?:\.\d+)?)\s*(?:x|×|\bby\b)\s*(\d+(?:\.\d+)?)",
+            r"(\d+(?:\.\d+)?)\s*(?:x|×|✕|╳|\*|by)\s*(\d+(?:\.\d+)?)",
             text_lower,
             re.IGNORECASE,
         )
         is not None
+    )
+
+
+def _normalize_user_line_for_wizard(text: str) -> str:
+    t = unicodedata.normalize("NFKC", text).strip()
+    t = re.sub(r"[\u200b-\u200d\ufeff]", "", t)
+    t = t.replace("\u00a0", " ")
+    t = (
+        t.replace("×", "x")
+        .replace("✕", "x")
+        .replace("╳", "x")
+        .replace("∗", "*")
+        .replace("＊", "*")
+    )
+    return t.strip()
+
+
+def _has_step1_product_signals(low: str) -> bool:
+    """True when the line looks like label specs even if strict rich/qty×dim didn’t both parse."""
+    return bool(
+        _extract_quantity(low) is not None
+        or _extract_dimensions(low)
+        or _STEP1_MATERIAL_RE.search(low)
+        or _STEP1_FINISH_RE.search(low)
+        or _STEP1_COLORS_RE.search(low)
+        or re.search(r"\b(labels?|stickers?)\b", low)
     )
 
 
@@ -555,7 +593,7 @@ def handle_estimate_flow(
 ) -> EstimateFlowResult:
     """Deterministic quoting wizard. Fallback to Grok via ``EstimateFlowResult(handled=False)``."""
 
-    raw = shopper_utterance_for_estimate_heuristics(user_message)
+    raw = _normalize_user_line_for_wizard(shopper_utterance_for_estimate_heuristics(user_message))
     if not raw:
         return EstimateFlowResult(handled=False)
 
@@ -643,6 +681,28 @@ def handle_estimate_flow(
                 assistant_meta=_meta_payload(draft, pending_step_index=0),
                 estimate_id=None,
             )
+
+        if not rich:
+            if should_skip_estimate_wizard_opener(raw):
+                return EstimateFlowResult(handled=False)
+            if _has_step1_product_signals(msg_lower):
+                draft["product_details"] = raw
+                qh = _extract_quantity(msg_lower)
+                if qh:
+                    draft["_quantity_hint"] = qh
+                miss_txt = ", ".join(_step1_missing_parts(msg_lower))
+                return EstimateFlowResult(
+                    handled=True,
+                    reply=(
+                        f"**Step 1/5:** I’ve captured: **{raw}**\n\n"
+                        f"Still need: {miss_txt}.\n\n"
+                        "Send the missing pieces in another line if that’s easier—I’ll combine them."
+                    ),
+                    assistant_meta=_meta_payload(draft, pending_step_index=0),
+                    estimate_id=None,
+                )
+            if not _EXPLICIT_QUOTE_COLD_OPENER_RE.search(msg_lower):
+                return EstimateFlowResult(handled=False)
 
         reply = _prompt_for_pending_index(0)
         return EstimateFlowResult(
