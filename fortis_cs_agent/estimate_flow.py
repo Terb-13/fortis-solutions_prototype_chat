@@ -1,7 +1,8 @@
 """
 Deterministic Estimate Mode: capture quote fields sequentially, optionally bypassing Grok.
 
-State persists on the assistant message ``meta["estimate_flow"]``.
+State persists in Supabase ``fortis_estimate_sessions`` (per conversation) and is mirrored on
+the assistant message ``meta["estimate_flow"]`` for the UI.
 """
 
 from __future__ import annotations
@@ -16,13 +17,19 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from fortis_cs_agent.estimate_detector import is_estimate_request, should_skip_estimate_wizard_opener, shopper_utterance_for_estimate_heuristics
+from fortis_cs_agent.estimate_sessions import (
+    EstimateSessionStatus,
+    fetch_estimate_session,
+    update_estimate_session_status,
+    upsert_estimate_session,
+)
 from fortis_cs_agent.knowledge import retrieve_pricing
 from fortis_cs_agent.tools import execute_agent_tool
 
 logger = logging.getLogger(__name__)
 
 # Bumped when changing estimate wizard behavior; exposed on GET /health for deploy verification.
-ESTIMATE_FLOW_BUILD = "wizard-v12-thread-user-extract"
+ESTIMATE_FLOW_BUILD = "wizard-v13-supabase-sessions"
 
 _STEPS = ("product_details", "business_name", "contact_name", "email", "address")
 _DEFAULT_NOTES = "This quote does not include shipping or taxes. Prices are valid for 30 days."
@@ -170,6 +177,74 @@ def _step1_missing_parts(low: str) -> list[str]:
 
 def _step1_specs_complete(low: str) -> bool:
     return not _step1_missing_parts(low)
+
+
+def _stored_collected_to_draft(data: dict[str, Any]) -> dict[str, Any]:
+    """Rebuild internal wizard draft from JSONB ``collected_data``."""
+    draft: dict[str, Any] = {}
+    pd = data.get("product_details")
+    if pd and str(pd).strip():
+        draft["product_details"] = str(pd).strip()
+    else:
+        parts: list[str] = []
+        if data.get("quantity") is not None:
+            try:
+                parts.append(f"{int(data['quantity'])} labels")
+            except (TypeError, ValueError):
+                pass
+        sz = data.get("size")
+        if sz and str(sz).strip():
+            s = str(sz).strip()
+            low_s = s.lower()
+            if re.search(r"\d", s) and "x" in low_s and "in" not in low_s and not low_s.endswith("labels"):
+                parts.append(f"{s} in")
+            else:
+                parts.append(s)
+        for key in ("material", "finish", "colors"):
+            v = data.get(key)
+            if v and str(v).strip():
+                parts.append(str(v).strip())
+        if parts:
+            draft["product_details"] = "; ".join(parts)
+    qh = data.get("_quantity_hint")
+    if qh is not None:
+        try:
+            draft["_quantity_hint"] = int(qh)
+        except (TypeError, ValueError):
+            pass
+    elif data.get("quantity") is not None:
+        try:
+            draft["_quantity_hint"] = int(data["quantity"])
+        except (TypeError, ValueError):
+            pass
+    for k in ("business_name", "contact_name", "email", "address"):
+        v = data.get(k)
+        if v is not None and str(v).strip():
+            draft[k] = str(v).strip()
+    return draft
+
+
+def _draft_to_stored_collected(draft: dict[str, Any]) -> dict[str, Any]:
+    """Flatten internal draft to JSONB with structured label fields plus product_details blob."""
+    blob = str(draft.get("product_details") or "")
+    low = blob.lower()
+    dim_m = re.search(r"(\d+(?:\.\d+)?)\s*(?:x|×|✕|╳)\s*(\d+(?:\.\d+)?)", low, re.IGNORECASE)
+    mat_m = _STEP1_MATERIAL_RE.search(low)
+    fin_m = _STEP1_FINISH_RE.search(low)
+    col_m = _STEP1_COLORS_RE.search(low)
+    return {
+        "quantity": _extract_quantity(low),
+        "size": f"{dim_m.group(1)}x{dim_m.group(2)}" if dim_m else None,
+        "material": mat_m.group(0).strip() if mat_m else None,
+        "finish": fin_m.group(0).strip() if fin_m else None,
+        "colors": col_m.group(0).strip() if col_m else None,
+        "business_name": (str(draft["business_name"]).strip() if draft.get("business_name") else None),
+        "contact_name": (str(draft["contact_name"]).strip() if draft.get("contact_name") else None),
+        "email": (str(draft["email"]).strip() if draft.get("email") else None),
+        "address": (str(draft["address"]).strip() if draft.get("address") else None),
+        "product_details": blob.strip() or None,
+        "_quantity_hint": draft.get("_quantity_hint"),
+    }
 
 
 def _merge_step1_blob(prior: str, answer: str) -> str:
@@ -586,6 +661,24 @@ def latest_estimate_flow_snapshot(history_rows: list[dict[str, Any]]) -> tuple[d
     return _infer_snapshot_from_assistant_content(history_rows)
 
 
+def _resolve_wizard_snap(
+    conversation_id: str,
+    conversation_history: list[dict[str, Any]],
+    session_row: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], int] | None:
+    """Prefer Supabase wizard session when active; else assistant meta / history snapshot."""
+    if session_row is None:
+        session_row = fetch_estimate_session(conversation_id)
+    if session_row and session_row.get("status") in ("in_progress", "paused"):
+        cd = session_row.get("collected_data") or {}
+        if not isinstance(cd, dict):
+            cd = {}
+        draft_db = _stored_collected_to_draft(cd)
+        pending = _first_pending_step_index(draft_db)
+        return draft_db, pending
+    return latest_estimate_flow_snapshot(conversation_history)
+
+
 def _meta_payload(draft: dict[str, Any], pending_step_index: int, *, active: bool = True) -> dict[str, Any]:
     return {
         "estimate_flow": {
@@ -751,6 +844,56 @@ class EstimateFlowResult:
     estimate_id: str | None = None
 
 
+def sync_wizard_session_from_result(*, conversation_id: str, result: EstimateFlowResult) -> None:
+    """Persist wizard draft + step to ``fortis_estimate_sessions`` after a handled turn."""
+    if not result.handled:
+        return
+    meta = result.assistant_meta or {}
+    block = meta.get("estimate_flow")
+    if not isinstance(block, dict):
+        return
+    draft = block.get("draft")
+    if not isinstance(draft, dict):
+        draft = {}
+    draft = dict(draft)
+    active = block.get("active")
+    active = True if active is None else bool(active)
+    completed = block.get("completed") is True
+    if completed:
+        if not draft.get("product_details") and not draft.get("business_name"):
+            row = fetch_estimate_session(conversation_id)
+            if row and isinstance(row.get("collected_data"), dict):
+                draft = _stored_collected_to_draft(row["collected_data"])
+        st: EstimateSessionStatus = "completed"
+    elif not active:
+        st = "abandoned"
+    else:
+        st = "in_progress"
+    fp = _first_pending_step_index(draft)
+    current_step = min(fp + 1, 5)
+    if completed:
+        current_step = 5
+    collected = _draft_to_stored_collected(draft)
+    upsert_estimate_session(
+        conversation_id,
+        current_step=current_step,
+        collected_data=collected,
+        status=st,
+    )
+
+
+def maybe_pause_wizard_session_on_topic_shift(conversation_id: str, user_message: str) -> None:
+    """If the shopper veers off (capability / meta) mid-wizard, pause without dropping collected data."""
+    raw = _normalize_user_line_for_wizard(shopper_utterance_for_estimate_heuristics(user_message))
+    if not raw:
+        return
+    row = fetch_estimate_session(conversation_id)
+    if not row or row.get("status") != "in_progress":
+        return
+    if should_skip_estimate_wizard_opener(raw) and not is_estimate_request(raw):
+        update_estimate_session_status(conversation_id, "paused")
+
+
 def handle_estimate_flow(
     *,
     user_message: str,
@@ -763,7 +906,18 @@ def handle_estimate_flow(
     if not raw:
         return EstimateFlowResult(handled=False)
 
-    snap = latest_estimate_flow_snapshot(conversation_history)
+    session_row = fetch_estimate_session(conversation_id)
+    if session_row and session_row.get("status") == "in_progress":
+        if should_skip_estimate_wizard_opener(raw) and not is_estimate_request(raw):
+            update_estimate_session_status(conversation_id, "paused")
+            return EstimateFlowResult(handled=False)
+    if session_row and session_row.get("status") == "paused":
+        if should_skip_estimate_wizard_opener(raw) and not is_estimate_request(raw):
+            return EstimateFlowResult(handled=False)
+        update_estimate_session_status(conversation_id, "in_progress")
+        session_row = fetch_estimate_session(conversation_id)
+
+    snap = _resolve_wizard_snap(conversation_id, conversation_history, session_row)
     carrying = snap is not None
 
     # Hard guard: never open the wizard on capability / refusal / SBU / general-topic openers.

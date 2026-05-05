@@ -722,6 +722,7 @@ async def health() -> dict[str, Any]:
         "supabase_jwt_role": _supabase_jwt_role_hint(),
         "pricing_health": pricing_health_probe(),
         "estimate_flow_build": _estimate_flow.ESTIMATE_FLOW_BUILD,
+        "estimate_sessions_table": os.getenv("FORTIS_ESTIMATE_SESSIONS_TABLE", "fortis_estimate_sessions"),
         "vercel_git_commit_sha": (os.getenv("VERCEL_GIT_COMMIT_SHA") or "").strip() or None,
         "vercel_git_commit_ref": (os.getenv("VERCEL_GIT_COMMIT_REF") or "").strip() or None,
     }
@@ -767,7 +768,11 @@ async def chat(req: ChatRequest, res: Response) -> ChatResponse:
             reply = estimate_flow_result.reply
             estimate_id = estimate_flow_result.estimate_id
             assistant_meta = estimate_flow_result.assistant_meta
+            _estimate_flow.sync_wizard_session_from_result(
+                conversation_id=cid, result=estimate_flow_result
+            )
         else:
+            _estimate_flow.maybe_pause_wizard_session_on_topic_shift(cid, req.message)
             reply = await run_agent_turn(req.message, conversation_id=cid)
             reply, estimate_id = await persist_estimate_from_assistant_json(reply, conversation_id=cid)
             assistant_meta = None
@@ -898,7 +903,11 @@ async def twilio_webhook(request: Request) -> Response:
         if sms_flow.handled:
             reply_text = sms_flow.reply
             assistant_meta_twilio = sms_flow.assistant_meta
+            _estimate_flow.sync_wizard_session_from_result(
+                conversation_id=cid, result=sms_flow
+            )
         else:
+            _estimate_flow.maybe_pause_wizard_session_on_topic_shift(cid, body_text)
             reply_text = await run_agent_turn(body_text, conversation_id=cid, augment_knowledge=True)
             reply_text, _estimate_id_saved = await persist_estimate_from_assistant_json(
                 reply_text, conversation_id=cid

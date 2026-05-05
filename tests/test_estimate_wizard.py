@@ -168,6 +168,27 @@ class TestFullThreadProxyBlob(unittest.TestCase):
         self.assertIn("Step 3/5", r.reply)
 
 
+class TestCollectedDataMapping(unittest.TestCase):
+    """JSONB ``collected_data`` ↔ internal draft helpers (no Supabase required)."""
+
+    def test_round_trip_preserves_product_and_contact_fields(self) -> None:
+        from fortis_cs_agent.estimate_flow import _draft_to_stored_collected, _stored_collected_to_draft
+
+        draft = {
+            "product_details": "5000 2x3 white bopp gloss cmyk",
+            "_quantity_hint": 5000,
+            "business_name": "Acme LLC",
+            "contact_name": "Jane Doe",
+        }
+        flat = _draft_to_stored_collected(draft)
+        self.assertEqual(flat.get("quantity"), 5000)
+        self.assertEqual(flat.get("business_name"), "Acme LLC")
+        back = _stored_collected_to_draft(flat)
+        self.assertIn("2x3", back.get("product_details", ""))
+        self.assertEqual(back.get("business_name"), "Acme LLC")
+        self.assertEqual(back.get("contact_name"), "Jane Doe")
+
+
 class TestShouldSkipWizardOpener(unittest.TestCase):
     def test_blocks_meta_and_refusals(self) -> None:
         for msg in (
