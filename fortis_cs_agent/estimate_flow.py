@@ -6,6 +6,7 @@ State persists on the assistant message ``meta["estimate_flow"]``.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -20,7 +21,7 @@ from fortis_cs_agent.tools import execute_agent_tool
 logger = logging.getLogger(__name__)
 
 # Bumped when changing estimate wizard behavior; exposed on GET /health for deploy verification.
-ESTIMATE_FLOW_BUILD = "wizard-v4-restart-and-detector"
+ESTIMATE_FLOW_BUILD = "wizard-v5-partial-step1-meta-fallback"
 
 _STEPS = ("product_details", "business_name", "contact_name", "email", "address")
 _DEFAULT_NOTES = "This quote does not include shipping or taxes. Prices are valid for 30 days."
@@ -84,6 +85,93 @@ def _extract_dimensions(text_lower: str) -> bool:
     )
 
 
+def _coerce_meta_outer(raw: Any) -> dict[str, Any]:
+    """PostgREST / drivers may return ``meta`` as a JSON string; normalize to dict."""
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            val = json.loads(raw)
+            return val if isinstance(val, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+_STEP_HEADER_RE = re.compile(r"\*\*Step\s+(\d)/5\*\*|Step\s+(\d)/5\s*:", re.IGNORECASE)
+_STEP1_MATERIAL_RE = re.compile(
+    r"\b(bopp|pet|vinyl|vynil|paper|poly|polyprop|polypropylene|\bpp\b|\bpe\b|film|foil|kimdura|tyvek)\b",
+    re.IGNORECASE,
+)
+_STEP1_FINISH_RE = re.compile(
+    r"\b(gloss|matte|\bmat\b|satin|soft[\s-]?touch|uv\b|lam|laminated|varnish)\b",
+    re.IGNORECASE,
+)
+_STEP1_COLORS_RE = re.compile(
+    r"\b(cmyk|process|4[\s/]*c|four[\s-]?color|full[\s-]?col|spot|1[\s-]?col|one[\s-]?color|\bpms\b|pantone)\b",
+    re.IGNORECASE,
+)
+
+
+def _step1_missing_parts(low: str) -> list[str]:
+    miss: list[str] = []
+    if _extract_quantity(low) is None:
+        miss.append("**quantity**")
+    if not _extract_dimensions(low):
+        miss.append("**size (W×H in.)**")
+    if not _STEP1_MATERIAL_RE.search(low):
+        miss.append("**material** (e.g. white BOPP)")
+    if not _STEP1_FINISH_RE.search(low):
+        miss.append("**finish** (e.g. gloss)")
+    if not _STEP1_COLORS_RE.search(low):
+        miss.append("**print colors** (e.g. CMYK)")
+    return miss
+
+
+def _step1_specs_complete(low: str) -> bool:
+    return not _step1_missing_parts(low)
+
+
+def _merge_step1_blob(prior: str, answer: str) -> str:
+    p, a = prior.strip(), answer.strip()
+    if not p:
+        return a
+    if not a:
+        return p
+    if a.lower() in p.lower():
+        return p
+    if p.lower() in a.lower():
+        return a
+    return f"{p}; {a}"
+
+
+def _infer_snapshot_from_assistant_content(
+    history_rows: list[dict[str, Any]],
+) -> tuple[dict[str, Any], int] | None:
+    """If ``meta`` was dropped (e.g. JSON string not parsed client-side), recover step from assistant copy."""
+    for row in reversed(history_rows):
+        if row.get("role") != "assistant":
+            continue
+        content = row.get("content") or ""
+        m = _STEP_HEADER_RE.search(content)
+        if not m:
+            continue
+        n = int(m.group(1) or m.group(2))
+        idx = max(0, min(n - 1, len(_STEPS) - 1))
+        meta = _coerce_meta_outer(row.get("meta"))
+        block = meta.get("estimate_flow")
+        if isinstance(block, dict) and block.get("completed") is True:
+            continue
+        logger.info(
+            "estimate_flow inferred step_index=%s from assistant content (meta missing or inactive on latest rows)",
+            idx,
+        )
+        return {}, idx
+    return None
+
+
 def _looks_like_email(s: str) -> bool:
     s = (s or "").strip()
     return "@" in s and "." in s.split("@", 1)[-1]
@@ -134,9 +222,7 @@ def latest_estimate_flow_snapshot(history_rows: list[dict[str, Any]]) -> tuple[d
     for row in reversed(history_rows):
         if row.get("role") != "assistant":
             continue
-        meta_outer = row.get("meta") or {}
-        if not isinstance(meta_outer, dict):
-            continue
+        meta_outer = _coerce_meta_outer(row.get("meta"))
         block = meta_outer.get("estimate_flow")
         if not isinstance(block, dict):
             continue
@@ -148,7 +234,7 @@ def latest_estimate_flow_snapshot(history_rows: list[dict[str, Any]]) -> tuple[d
         idx = int(block.get("pending_step_index", 0))
         idx = max(0, min(idx, len(_STEPS) - 1))
         return draft, idx
-    return None
+    return _infer_snapshot_from_assistant_content(history_rows)
 
 
 def _meta_payload(draft: dict[str, Any], pending_step_index: int, *, active: bool = True) -> dict[str, Any]:
@@ -344,18 +430,30 @@ def handle_estimate_flow(
         )
 
     if not carrying:
-        draft: dict[str, Any] = {}
+        draft = {}
         rich = _extract_quantity(msg_lower) is not None and _extract_dimensions(msg_lower)
         if rich:
             draft["product_details"] = raw
             qh = _extract_quantity(msg_lower)
             if qh:
                 draft["_quantity_hint"] = qh
-            reply = _prompt_for_pending_index(1)
+            if _step1_specs_complete(msg_lower):
+                reply = _prompt_for_pending_index(1)
+                return EstimateFlowResult(
+                    handled=True,
+                    reply=reply,
+                    assistant_meta=_meta_payload(draft, pending_step_index=1),
+                    estimate_id=None,
+                )
+            miss_txt = ", ".join(_step1_missing_parts(msg_lower))
             return EstimateFlowResult(
                 handled=True,
-                reply=reply,
-                assistant_meta=_meta_payload(draft, pending_step_index=1),
+                reply=(
+                    f"**Step 1/5:** I’ve captured: **{raw}**\n\n"
+                    f"Still need: {miss_txt}.\n\n"
+                    "Send the missing pieces in another line if that’s easier—I’ll combine them."
+                ),
+                assistant_meta=_meta_payload(draft, pending_step_index=0),
                 estimate_id=None,
             )
 
@@ -371,6 +469,20 @@ def handle_estimate_flow(
     draft, pending_idx = snap
     draft = dict(draft)
     pending_idx = max(0, min(pending_idx, len(_STEPS) - 1))
+
+    if pending_idx >= 1 and not str(draft.get("product_details") or "").strip():
+        logger.warning(
+            "estimate_flow reset: pending_step_index=%s but product_details empty cid=%s",
+            pending_idx,
+            conversation_id,
+        )
+        return EstimateFlowResult(
+            handled=True,
+            reply=_prompt_for_pending_index(0),
+            assistant_meta=_meta_payload({}, pending_step_index=0),
+            estimate_id=None,
+        )
+
     step_key = _STEPS[pending_idx]
 
     if msg_lower in {"cancel", "stop", "never mind"} and pending_idx <= 2:
@@ -383,10 +495,25 @@ def handle_estimate_flow(
     answer = raw.strip()
 
     if step_key == "product_details":
-        draft["product_details"] = answer
-        q = _extract_quantity(answer.lower())
+        prior = str(draft.get("product_details") or "").strip()
+        merged = _merge_step1_blob(prior, answer)
+        draft["product_details"] = merged
+        low = merged.lower()
+        q = _extract_quantity(low)
         if q:
             draft["_quantity_hint"] = q
+        if not _step1_specs_complete(low):
+            miss_txt = ", ".join(_step1_missing_parts(low))
+            return EstimateFlowResult(
+                handled=True,
+                reply=(
+                    f"**Step 1/5:** Here’s what I have so far: **{merged}**\n\n"
+                    f"Still need: {miss_txt}.\n\n"
+                    "Add the rest in one line or another short line—I’ll keep combining."
+                ),
+                assistant_meta=_meta_payload(draft, pending_step_index=0),
+                estimate_id=None,
+            )
     elif step_key == "business_name":
         draft["business_name"] = answer
     elif step_key == "contact_name":
