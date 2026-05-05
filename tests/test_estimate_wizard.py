@@ -8,6 +8,33 @@ from fortis_cs_agent.estimate_detector import is_estimate_request, should_skip_e
 from fortis_cs_agent.estimate_flow import handle_estimate_flow
 
 
+class TestWrappedCustomerMessageBlob(unittest.TestCase):
+    """Portal/proxy may POST augmented blobs; intent must use text after Customer message:."""
+
+    def test_capability_after_wrapper_not_estimate(self) -> None:
+        blob = (
+            "Internal reference only. Quick Ship label quotes and pricing context.\n\n"
+            "Customer message:\n"
+            "what can you do?"
+        )
+        self.assertFalse(is_estimate_request(blob))
+        self.assertTrue(should_skip_estimate_wizard_opener(blob))
+
+    def test_real_quote_after_wrapper_still_intent(self) -> None:
+        blob = "Training: estimates use SKUs.\n\nCustomer message:\ncreate an estimate"
+        self.assertTrue(is_estimate_request(blob))
+
+    def test_flow_skips_wizard_for_wrapped_capability(self) -> None:
+        r = handle_estimate_flow(
+            user_message=(
+                "For Quick Ship use quote rows.\n\nCustomer message:\nwhat can you do?"
+            ),
+            conversation_history=[],
+            conversation_id="00000000-0000-4000-8000-000000000040",
+        )
+        self.assertFalse(r.handled)
+
+
 class TestShouldSkipWizardOpener(unittest.TestCase):
     def test_blocks_meta_and_refusals(self) -> None:
         for msg in (

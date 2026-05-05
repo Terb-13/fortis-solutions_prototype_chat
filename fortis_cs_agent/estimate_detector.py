@@ -200,7 +200,7 @@ def is_estimate_request(message: str) -> bool:
     Strict: requires clear pricing/quote intent, label qty, or product+quantity context.
     Excludes capability questions (even with a leading greeting) and explicit refusals.
     """
-    text = (message or "").strip()
+    text = shopper_utterance_for_estimate_heuristics(message)
     if not text:
         return False
 
@@ -234,13 +234,33 @@ def is_estimate_request(message: str) -> bool:
     return False
 
 
+def shopper_utterance_for_estimate_heuristics(message: str) -> str:
+    """
+    Use the real shopper line when a proxy forwards an augmented blob.
+
+    Model/RAG wrappers often end with ``Customer message:`` + the user’s words; scanning the
+    whole blob falsely matches training words like “quote” / “pricing” and starts the wizard.
+    """
+    t = (message or "").strip()
+    if not t:
+        return ""
+    t = re.sub(r"[\u200b-\u200d\ufeff]", "", t)
+    t = t.replace("\u00a0", " ")
+    parts = re.split(r"(?i)\bcustomer\s+message\s*:\s*", t)
+    if len(parts) >= 2:
+        core = parts[-1].strip()
+        if core:
+            return core
+    return t.strip()
+
+
 def should_skip_estimate_wizard_opener(message: str) -> bool:
     """
     If True, ``handle_estimate_flow`` must not *start* the wizard on this message.
 
     Quote/pricing/product signals override the hard block (e.g. “what can you do for a quote?”).
     """
-    t = (message or "").strip()
+    t = shopper_utterance_for_estimate_heuristics(message)
     if not t:
         return False
     if _hard_block_quote_intent_override(t):
