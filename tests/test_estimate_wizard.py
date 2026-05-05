@@ -4,8 +4,24 @@ from __future__ import annotations
 
 import unittest
 
-from fortis_cs_agent.estimate_detector import is_estimate_request
+from fortis_cs_agent.estimate_detector import is_estimate_request, should_skip_estimate_wizard_opener
 from fortis_cs_agent.estimate_flow import handle_estimate_flow
+
+
+class TestShouldSkipWizardOpener(unittest.TestCase):
+    def test_blocks_meta_and_refusals(self) -> None:
+        for msg in (
+            "what can you do?",
+            "Hi — what can you do?",
+            "I don't want an estimate.",
+            "I'd like to know about the sbu",
+            "just asking about your return policy",
+        ):
+            self.assertTrue(should_skip_estimate_wizard_opener(msg), msg=repr(msg))
+
+    def test_overridden_by_quote_intent(self) -> None:
+        self.assertFalse(should_skip_estimate_wizard_opener("what can you do for a quote?"))
+        self.assertFalse(should_skip_estimate_wizard_opener("just asking about pricing for 2x3 labels"))
 
 
 class TestEstimateDetector(unittest.TestCase):

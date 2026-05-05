@@ -14,14 +14,14 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from fortis_cs_agent.estimate_detector import is_estimate_request
+from fortis_cs_agent.estimate_detector import is_estimate_request, should_skip_estimate_wizard_opener
 from fortis_cs_agent.knowledge import retrieve_pricing
 from fortis_cs_agent.tools import execute_agent_tool
 
 logger = logging.getLogger(__name__)
 
 # Bumped when changing estimate wizard behavior; exposed on GET /health for deploy verification.
-ESTIMATE_FLOW_BUILD = "wizard-v6-history-recovery-labeled-forms"
+ESTIMATE_FLOW_BUILD = "wizard-v7-opener-hard-block"
 
 _STEPS = ("product_details", "business_name", "contact_name", "email", "address")
 _DEFAULT_NOTES = "This quote does not include shipping or taxes. Prices are valid for 30 days."
@@ -556,9 +556,14 @@ def handle_estimate_flow(
     """Deterministic quoting wizard. Fallback to Grok via ``EstimateFlowResult(handled=False)``."""
 
     raw = (user_message or "").strip()
-    req = is_estimate_request(raw)
     snap = latest_estimate_flow_snapshot(conversation_history)
     carrying = snap is not None
+
+    # Hard guard: never open the wizard on capability / refusal / SBU / general-topic openers.
+    if not carrying and should_skip_estimate_wizard_opener(raw):
+        return EstimateFlowResult(handled=False)
+
+    req = is_estimate_request(raw)
 
     if not req and not carrying:
         return EstimateFlowResult(handled=False)

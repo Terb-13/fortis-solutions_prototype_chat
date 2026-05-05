@@ -102,6 +102,65 @@ _STRICT_KEYWORD_RE = re.compile(
     r"|\bquick\s+ship\b"
 )
 
+# Opening-turn hard block: never start the wizard on these (server + model guardrails).
+# Substrings, not ^-anchored, so leading greetings still match.
+_WIZARD_OPENER_HARD_BLOCK_RE = re.compile(
+    r"(?i)"
+    r"what\s+can\s+you\s+do"
+    r"|what\s+do\s+you\s+do"
+    r"|what\s+are\s+you\s+able\s+to\s+do"
+    r"|how\s+can\s+you\s+help"
+    r"|who\s+are\s+you"
+    r"|i\s+don'?t\s+want\b.*\bestimate"
+    r"|don'?t\s+want\b.*\bestimate"
+    r"|don'?t\s+need\b.*\bestimate"
+    r"|not\s+interested\s+in\b.*\bestimate"
+    r"|'d\s+like\s+to\s+know\s+about\s+the\s+sbu"
+    r"|would\s+like\s+to\s+know\s+about\s+the\s+sbu"
+    r"|know\s+about\s+the\s+sbu"
+    r"|about\s+the\s+sbu"
+    r"|\bsbu\b.{0,80}\b(tell|tell\s+me|explain|information|learn|know\s+more)"
+    r"|\bjust\s+asking\b"
+)
+
+# Like _STRICT_KEYWORD_RE but omits bare estimate/quote/prices tokens so refusals (“don’t want an estimate”)
+# do not clear the opener hard block via a false-positive “buying” signal. Omits get/need/want+quote too (handled
+# by _STRONG_QUOTE_INTENT_RE with don’t/do-not lookbehinds).
+_STRICT_KEYWORD_RE_PHRASE_ONLY = re.compile(
+    r"(?i)"
+    r"\bpricing\b"
+    r"|\ball-?in\b.{0,12}\bpric"
+    r"|\bballpark\b"
+    r"|\bhow\s+much\b"
+    r"|\bcreate\s+(an?\s+)?estimate\b"
+    r"|\bprice\s+quote\b"
+    r"|\bpricing\s+out\b"
+    r"|\bprice\s+for\b"
+    r"|\bpricing\s+on\b"
+    r"|\bcan\s+you\s+quote\b"
+    r"|\bgive\s+me\s+(a\s+)?price\b"
+    r"|\bwhat\s+would\s+it\s+cost\b"
+    r"|\bquick\s+ship\b"
+)
+
+
+def _hard_block_quote_intent_override(text: str) -> bool:
+    """True when phrasing should lift the opener hard block (but bare ‘estimate’ in a refusal does not)."""
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if _STRONG_QUOTE_INTENT_RE.search(raw):
+        return True
+    if _LABEL_QTY_RE.search(raw):
+        return True
+    low = raw.lower()
+    if re.search(r"\b\d{2,7}\b", raw) and re.search(
+        r"\b(labels?|stickers?|bopp|vinyl|poly|quick\s*ship|cmyk|flexo)\b",
+        low,
+    ):
+        return True
+    return bool(_STRICT_KEYWORD_RE_PHRASE_ONLY.search(low))
+
 
 def _has_quote_buying_signals(text: str) -> bool:
     """True if the utterance includes explicit quote/pricing/product request cues (anywhere)."""
@@ -173,3 +232,17 @@ def is_estimate_request(message: str) -> bool:
         return False
 
     return False
+
+
+def should_skip_estimate_wizard_opener(message: str) -> bool:
+    """
+    If True, ``handle_estimate_flow`` must not *start* the wizard on this message.
+
+    Quote/pricing/product signals override the hard block (e.g. “what can you do for a quote?”).
+    """
+    t = (message or "").strip()
+    if not t:
+        return False
+    if _hard_block_quote_intent_override(t):
+        return False
+    return bool(_WIZARD_OPENER_HARD_BLOCK_RE.search(t))
