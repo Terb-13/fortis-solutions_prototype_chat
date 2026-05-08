@@ -29,7 +29,13 @@ from fortis_cs_agent.estimate_detector import is_estimate_request
 # Bind estimate_flow only via _estimate_flow (avoid a second import from the estimate_flow submodule).
 from fortis_cs_agent import estimate_flow as _estimate_flow
 from fortis_cs_agent.estimate_sessions import EstimateSessionPersistenceError
-from fortis_cs_agent.knowledge import format_pricing_context, pricing_health_probe, retrieve_knowledge, retrieve_pricing
+from fortis_cs_agent.knowledge import (
+    format_pricing_context,
+    pricing_health_probe,
+    retrieve_faq,
+    retrieve_knowledge,
+    retrieve_pricing,
+)
 from fortis_cs_agent.prompts import render_system_prompt
 from fortis_cs_agent.store import load_estimate_snapshot
 from fortis_cs_agent.tools import AGENT_TOOLS, assemble_estimate_result, create_estimate, execute_agent_tool
@@ -652,7 +658,27 @@ async def run_agent_turn(
                 except Exception:
                     logger.exception("retrieve_knowledge failed; continuing without snippets.")
                     knowledge_results = []
-                knowledge_context = "\n\n".join([r["content"] for r in knowledge_results])
+                try:
+                    faq_results = retrieve_faq(user_text, limit=3)
+                except Exception:
+                    logger.exception("retrieve_faq failed; continuing without FAQ entries.")
+                    faq_results = []
+                # FAQ entries are labeled so the system prompt's facts-faithful
+                # rule can recognize them. Listed first; the prompt treats them
+                # as authoritative for direct matches.
+                sections: list[str] = []
+                for f in faq_results:
+                    q = (f.get("question") or "").strip()
+                    a = (f.get("answer") or "").strip()
+                    if not a:
+                        continue
+                    sections.append(f"[FAQ] Question: {q}\nAnswer: {a}")
+                for k in knowledge_results:
+                    content = (k.get("content") or "").strip()
+                    if not content:
+                        continue
+                    sections.append(content)
+                knowledge_context = "\n\n".join(sections)
 
     augmented = user_text
     if knowledge_context:

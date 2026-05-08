@@ -42,42 +42,185 @@ def _safe_ilike_term(raw: str) -> str | None:
     return t[:48]
 
 
+# English stop-words excluded from keyword extraction. Words ≤2 chars are
+# already filtered elsewhere; this list catches common 3+ char tokens that
+# would otherwise drown the keyword pool with noise (e.g. "tell", "about",
+# "the" matching tens of thousands of rows).
+STOP_WORDS = frozenset(
+    {
+        "the", "and", "but", "for", "yet", "nor",
+        "are", "was", "were", "been", "being",
+        "have", "has", "had",
+        "does", "did",
+        "will", "would", "shall", "should", "may", "might", "must",
+        "can", "could", "cant", "wont",
+        "tell", "ask", "ive",
+        "you", "your", "yours", "we", "our", "ours",
+        "they", "them", "their", "this", "that", "these", "those",
+        "about", "above", "below", "between", "through", "into", "onto", "from",
+        "what", "when", "where", "which", "who", "whom", "whose", "why", "how",
+        "whats", "wheres", "whens", "whos",
+        "its", "thats", "theres", "heres",
+        "any", "all", "some", "many", "much", "most", "more", "less", "few", "every",
+        "with", "without", "within",
+        "give", "got", "let", "lets", "make", "made",
+        "explain", "describe", "show",
+        "anything", "something", "nothing", "everything",
+    }
+)
+
+# Column weights for ranking: title hit > category hit > content hit.
+_TITLE_WEIGHT = 3
+_CATEGORY_WEIGHT = 2
+_CONTENT_WEIGHT = 1
+# FAQ-shape mirror: question = title-equivalent, answer = content-equivalent.
+_QUESTION_WEIGHT = 3
+_ANSWER_WEIGHT = 1
+
+# Wider candidate pool than the final `limit` so ranking has room to pick
+# the best matches. Cap on total keywords sent per call (post stop-word filter).
+_CANDIDATE_POOL_PER_KEYWORD = 20
+_MAX_KEYWORDS = 8
+
+
+def _extract_keywords(query: str) -> list[str]:
+    """Tokenize, drop stop-words and short tokens, normalize for ILIKE."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in (query or "").lower().split():
+        if len(raw) <= 2 or raw in STOP_WORDS:
+            continue
+        term = _safe_ilike_term(raw)
+        if not term or term in STOP_WORDS or term in seen:
+            continue
+        seen.add(term)
+        out.append(term)
+        if len(out) >= _MAX_KEYWORDS:
+            break
+    return out
+
+
 def retrieve_knowledge(query: str, limit: int = 5) -> List[Dict]:
     """
-    Search fortis_knowledge table for relevant content.
-    Uses simple ILIKE search for now (fast). Can upgrade to vector search later.
+    Search fortis_knowledge by keyword across title, content, category.
+
+    Stop-words excluded from keywords. Rows ranked by weighted match count
+    (title=3, category=2, content=1). Returns up to `limit` rows by score
+    (descending); rows with zero matches are dropped.
     """
     if not supabase or not query:
         return []
 
-    keywords = [k.strip() for k in query.lower().split() if len(k) > 2]
+    keywords = _extract_keywords(query)
+    if not keywords:
+        return []
 
-    results = []
-    seen_ids = set()
-
-    for keyword in keywords[:6]:
-        term = _safe_ilike_term(keyword)
-        if not term:
-            continue
+    candidates: dict[Any, dict[str, Any]] = {}
+    for kw in keywords:
         try:
             res = (
                 supabase.table("fortis_knowledge")
                 .select("id, title, content, category, source")
-                .ilike("content", f"%{term}%")
-                .limit(limit)
+                .or_(
+                    f"title.ilike.%{kw}%,content.ilike.%{kw}%,category.ilike.%{kw}%"
+                )
+                .limit(_CANDIDATE_POOL_PER_KEYWORD)
                 .execute()
             )
         except Exception:
-            logger.warning("retrieve_knowledge Supabase query failed term=%r", term, exc_info=True)
+            logger.warning("retrieve_knowledge Supabase query failed term=%r", kw, exc_info=True)
             continue
-        for row in res.data or []:
-            if row["id"] not in seen_ids:
-                seen_ids.add(row["id"])
-                results.append(row)
-                if len(results) >= limit:
-                    return results
 
-    return results
+        for row in res.data or []:
+            entry = candidates.setdefault(
+                row.get("id"),
+                {"row": row, "title_kw": set(), "content_kw": set(), "category_kw": set()},
+            )
+            t = (row.get("title") or "").lower()
+            c = (row.get("content") or "").lower()
+            cat = (row.get("category") or "").lower()
+            if kw in t:
+                entry["title_kw"].add(kw)
+            if kw in c:
+                entry["content_kw"].add(kw)
+            if kw in cat:
+                entry["category_kw"].add(kw)
+
+    if not candidates:
+        return []
+
+    def _score(entry: dict[str, Any]) -> int:
+        return (
+            _TITLE_WEIGHT * len(entry["title_kw"])
+            + _CATEGORY_WEIGHT * len(entry["category_kw"])
+            + _CONTENT_WEIGHT * len(entry["content_kw"])
+        )
+
+    scored = [e for e in candidates.values() if _score(e) > 0]
+    ranked = sorted(scored, key=_score, reverse=True)
+    return [e["row"] for e in ranked[:limit]]
+
+
+def retrieve_faq(query: str, limit: int = 5) -> List[Dict]:
+    """
+    Search fortis_faq by keyword across question, answer, category.
+
+    Same ranking shape as retrieve_knowledge but with FAQ weights:
+    question=3, category=2, answer=1. Filters to ``published=True`` so
+    draft entries from the admin training loop don't reach customers.
+    """
+    if not supabase or not query:
+        return []
+
+    keywords = _extract_keywords(query)
+    if not keywords:
+        return []
+
+    candidates: dict[Any, dict[str, Any]] = {}
+    for kw in keywords:
+        try:
+            res = (
+                supabase.table("fortis_faq")
+                .select("id, question, answer, category, published")
+                .eq("published", True)
+                .or_(
+                    f"question.ilike.%{kw}%,answer.ilike.%{kw}%,category.ilike.%{kw}%"
+                )
+                .limit(_CANDIDATE_POOL_PER_KEYWORD)
+                .execute()
+            )
+        except Exception:
+            logger.warning("retrieve_faq Supabase query failed term=%r", kw, exc_info=True)
+            continue
+
+        for row in res.data or []:
+            entry = candidates.setdefault(
+                row.get("id"),
+                {"row": row, "question_kw": set(), "answer_kw": set(), "category_kw": set()},
+            )
+            q = (row.get("question") or "").lower()
+            a = (row.get("answer") or "").lower()
+            cat = (row.get("category") or "").lower()
+            if kw in q:
+                entry["question_kw"].add(kw)
+            if kw in a:
+                entry["answer_kw"].add(kw)
+            if kw in cat:
+                entry["category_kw"].add(kw)
+
+    if not candidates:
+        return []
+
+    def _score(entry: dict[str, Any]) -> int:
+        return (
+            _QUESTION_WEIGHT * len(entry["question_kw"])
+            + _CATEGORY_WEIGHT * len(entry["category_kw"])
+            + _ANSWER_WEIGHT * len(entry["answer_kw"])
+        )
+
+    scored = [e for e in candidates.values() if _score(e) > 0]
+    ranked = sorted(scored, key=_score, reverse=True)
+    return [e["row"] for e in ranked[:limit]]
 
 
 # Pricing table text column (Postgres / Supabase schema uses comment_application).
