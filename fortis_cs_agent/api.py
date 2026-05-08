@@ -28,6 +28,7 @@ from fortis_cs_agent.estimate_detector import is_estimate_request
 
 # Bind estimate_flow only via _estimate_flow (avoid a second import from the estimate_flow submodule).
 from fortis_cs_agent import estimate_flow as _estimate_flow
+from fortis_cs_agent.estimate_sessions import EstimateSessionPersistenceError
 from fortis_cs_agent.knowledge import format_pricing_context, pricing_health_probe, retrieve_knowledge, retrieve_pricing
 from fortis_cs_agent.prompts import render_system_prompt
 from fortis_cs_agent.store import load_estimate_snapshot
@@ -753,17 +754,16 @@ async def chat(req: ChatRequest, res: Response) -> ChatResponse:
 
     history = load_recent_messages(cid) if persist else []
 
-    estimate_flow_result = _estimate_flow.handle_estimate_flow(
-        user_message=req.message,
-        conversation_history=history,
-        conversation_id=cid,
-    )
-
     reply: str
     estimate_id: str | None
     assistant_meta: dict[str, Any] | None
 
     try:
+        estimate_flow_result = _estimate_flow.handle_estimate_flow(
+            user_message=req.message,
+            conversation_history=history,
+            conversation_id=cid,
+        )
         if estimate_flow_result.handled:
             reply = estimate_flow_result.reply
             estimate_id = estimate_flow_result.estimate_id
@@ -778,6 +778,12 @@ async def chat(req: ChatRequest, res: Response) -> ChatResponse:
             assistant_meta = None
     except HTTPException:
         raise
+    except EstimateSessionPersistenceError:
+        logger.exception("chat: estimate session persistence failed (conversation_id=%s)", cid)
+        raise HTTPException(
+            status_code=503,
+            detail="Estimate state could not be saved. Please retry your message in a moment.",
+        ) from None
     except Exception:
         logger.exception("chat pipeline failed (conversation_id=%s)", cid)
         raise HTTPException(status_code=500, detail="Chat failed.") from None

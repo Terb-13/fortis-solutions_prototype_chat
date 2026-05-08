@@ -17,6 +17,15 @@ SESSIONS_TABLE = os.getenv("FORTIS_ESTIMATE_SESSIONS_TABLE", "fortis_estimate_se
 EstimateSessionStatus = Literal["in_progress", "paused", "completed", "abandoned"]
 
 
+class EstimateSessionPersistenceError(Exception):
+    """Raised when a wizard-state write to Supabase fails.
+
+    Callers in the chat path are expected to surface this as a retryable
+    error to the user (HTTP 503 for /chat, fallback SMS for /twilio-webhook),
+    so the user can retry instead of silently desyncing wizard state.
+    """
+
+
 def _client() -> Any | None:
     return _store.supabase
 
@@ -80,8 +89,11 @@ def upsert_estimate_session(
     }
     try:
         client.table(SESSIONS_TABLE).upsert([row], on_conflict="conversation_id").execute()
-    except Exception:
+    except Exception as exc:
         logger.exception("upsert_estimate_session failed conversation_id=%s", cid[:16])
+        raise EstimateSessionPersistenceError(
+            f"upsert_estimate_session failed for conversation_id={cid[:16]}"
+        ) from exc
 
 
 def update_estimate_session_status(conversation_id: str, status: EstimateSessionStatus) -> None:
@@ -96,5 +108,8 @@ def update_estimate_session_status(conversation_id: str, status: EstimateSession
         client.table(SESSIONS_TABLE).update({"status": status, "updated_at": now}).eq(
             "conversation_id", cid
         ).execute()
-    except Exception:
+    except Exception as exc:
         logger.exception("update_estimate_session_status failed conversation_id=%s", cid[:16])
+        raise EstimateSessionPersistenceError(
+            f"update_estimate_session_status failed for conversation_id={cid[:16]}"
+        ) from exc
