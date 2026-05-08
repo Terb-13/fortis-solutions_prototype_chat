@@ -102,6 +102,21 @@ _STRICT_KEYWORD_RE = re.compile(
     r"|\bquick\s+ship\b"
 )
 
+# Definitional questions about Quick Ship itself (NOT pricing requests). These are
+# topic-discussion shapes — what-is-X, tell-me-about, explain, how-does-X-work,
+# X-means-or-stands-for. Intentionally narrow: the user asking for a Quick Ship
+# quote or price must NOT match here so they fall through to _STRICT_KEYWORD_RE.
+_DEFINITIONAL_QUICK_SHIP_RE = re.compile(
+    r"(?i)"
+    r"\bwhat\s+(?:is|are|does)\s+(?:a|an|the)?\s*\bquick\s+ship\b"
+    r"|\bwhat'?s\s+(?:a|an|the)?\s*\bquick\s+ship\b"
+    r"|\btell\s+me\s+about\s+\bquick\s+ship\b"
+    r"|\bexplain\s+\bquick\s+ship\b"
+    r"|\bhow\s+does\s+\bquick\s+ship\s+work\b"
+    r"|\bquick\s+ship\b\s+(?:means?|stands?\s+for)\b"
+)
+
+
 # Connectivity / frustration lines — not quote requests (override can still allow mixed intent).
 _WIZARD_META_CHATTER_RE = re.compile(
     r"(?i)"
@@ -288,6 +303,13 @@ def is_estimate_request(message: str) -> bool:
     if _ESTIMATE_NON_REQUEST_RE.search(text):
         return False
 
+    # Definitional Quick Ship questions ("what is a quick ship order?") must not
+    # be classified as estimate requests just because _STRICT_KEYWORD_RE matches
+    # the bare phrase "quick ship" below. Pricing-intent shapes won't reach here
+    # because _STRONG_QUOTE_INTENT_RE / _LABEL_QTY_RE / digit-product fired earlier.
+    if _DEFINITIONAL_QUICK_SHIP_RE.search(text):
+        return False
+
     if _STRICT_KEYWORD_RE.search(message_lower):
         return True
 
@@ -368,6 +390,11 @@ def should_exit_estimate_wizard_for_topic_shift(message: str) -> bool:
         return False
     if is_estimate_request(t):
         return False
+    # Definitional Quick Ship questions are topic shifts mid-wizard. This must
+    # run BEFORE _hard_block_quote_intent_override, which still flags any "quick
+    # ship" mention as buying intent and would short-circuit the topic shift.
+    if _DEFINITIONAL_QUICK_SHIP_RE.search(t):
+        return True
     if _hard_block_quote_intent_override(t):
         return False
     if should_skip_estimate_wizard_opener(t):
