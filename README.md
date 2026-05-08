@@ -150,7 +150,7 @@ Configure the Twilio number’s **A Message Comes In** webhook to `POST https://
 ## Project layout
 
 ```
-fortis-chat/
+fortis-chatbot/
 ├── main.py
 ├── vercel.json
 ├── sql/fix_fortis_conversations_chat_columns.sql
