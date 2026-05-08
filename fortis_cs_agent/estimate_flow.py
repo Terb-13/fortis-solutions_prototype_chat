@@ -646,6 +646,11 @@ def _catalog_match_sentence(row: dict[str, Any]) -> str | None:
 
 def latest_estimate_flow_snapshot(history_rows: list[dict[str, Any]]) -> tuple[dict[str, Any], int] | None:
     """Return draft + pending step index (which field THIS user reply should fill)."""
+    # If a quote already completed in this thread, no carrying — earlier
+    # mid-wizard assistant turns still have meta.estimate_flow.active=True
+    # and would otherwise be picked up by the loop below as a stale snapshot.
+    if _wizard_quote_finished_in_history(history_rows):
+        return None
     for row in reversed(history_rows):
         if row.get("role") != "assistant":
             continue
@@ -692,6 +697,11 @@ def _resolve_wizard_snap(
         draft_db = _stored_collected_to_draft(cd)
         pending = _first_pending_step_index(draft_db)
         return draft_db, pending
+    # Completed/abandoned sessions don't carry; don't fall through to history-
+    # based recovery, which would otherwise return an earlier mid-wizard snapshot
+    # and re-engage the wizard on a post-quote turn (e.g. "10% discount?").
+    if session_row and session_row.get("status") in ("completed", "abandoned"):
+        return None
     return latest_estimate_flow_snapshot(conversation_history)
 
 
