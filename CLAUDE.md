@@ -40,13 +40,6 @@ sql/                             # Supabase schema files (canonical status TBD �
 scripts/                         # Utility scripts
 tests/                           # 7 pytest files
 .github/workflows/               # CI
-
-# Legacy — slated for removal (see §6.2 of architecture doc)
-app/                             # ⚠️ Legacy Next.js code — do not modify
-components/                      # ⚠️ Legacy
-lib/                             # ⚠️ Legacy
-package.json, package-lock.json  # ⚠️ Legacy
-next.config.*, next-env.d.ts     # ⚠️ Legacy
 ```
 
 ## Build / Dev / Test
@@ -124,14 +117,13 @@ Contains schema files for Supabase. **Important caveat:** `fortis-frontend/supab
 2. **Wizard state inconsistency** — bot loses place after topic switches. Priority: high.
 3. **Duplicate messages** — bot occasionally responds twice. Cause unclear; investigate post-Railway migration. Priority: high.
 4. **Vercel hosting limitations** — driving the Railway migration. Voice will require Railway anyway.
-5. **Legacy Next.js code** — `app/`, `components/`, `lib/`, `package.json`, etc. are all dead and should be removed.
-6. **Two PDF libraries in the project** — keep `fpdf2`, drop `@react-pdf/renderer` from frontend.
+5. **Two PDF libraries in the project** — keep `fpdf2`, drop `@react-pdf/renderer` from the frontend repo.
 
 ## Things Not To Touch
 
 - **Don't enable Supabase RLS** without explicit instruction. It's currently disabled because the backend is the only writer; turning it on now will break things until policies are written. RLS is on the Phase 2 punch list, not now.
 - **Don't hardcode the Grok model name.** It's `GROK_MODEL` env var. Several places in code rely on this — keep it that way.
-- **Don't write new code in the legacy Next.js folders** (`app/`, `components/`, `lib/`, etc.). They're being deleted.
+- **Don't add a Next.js app back into this repo.** Vercel builds only `main.py`. Quote pages live in the frontend repo.
 - **Don't commit secrets.** `.env` is gitignored; `.env.example` is the template.
 - **Don't introduce new AI providers without discussion.** xAI Grok (chat + voice) is the standard.
 
