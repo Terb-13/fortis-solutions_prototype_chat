@@ -28,7 +28,7 @@ from fortis_cs_agent.estimate_sessions import (
     update_estimate_session_status,
     upsert_estimate_session,
 )
-from fortis_cs_agent.knowledge import retrieve_pricing
+from fortis_cs_agent.knowledge import _extract_quantity, retrieve_pricing
 from fortis_cs_agent.tools import execute_agent_tool, quote_page_url
 
 logger = logging.getLogger(__name__)
@@ -77,25 +77,6 @@ def _qty_to_cost_key(qty: int) -> str:
     if qty >= 250:
         return "cost_250"
     return "cost_100"
-
-
-def _extract_quantity(text_lower: str) -> int | None:
-    """Parse 5000, 5,000, 5 000, and 5k as the same integer."""
-    text = re.sub(r"\b(\d{1,3})\s*k\b", lambda m: str(int(m.group(1)) * 1000), text_lower)
-    text = re.sub(r"\b(\d{1,3})[, ](\d{3})\b", r"\1\2", text)
-    patterns = (
-        r"\bquantity\s*(?:is|are|=|:)?\s*(\d{1,6})\b",
-        r"\bqty\s*(?:is|are|=|:)?\s*(\d{1,6})\b",
-        r"\b(\d{1,6})\s*(?:labels|units)\b",
-        r"\b(\d{2,6})\b",
-    )
-    for pat in patterns:
-        for m in re.finditer(pat, text):
-            q = int(m.group(1))
-            low = 10 if pat.startswith(r"\b(\d{2,6})") else 1
-            if low <= q <= 999_999:
-                return q
-    return None
 
 
 def _extract_dimensions(text_lower: str) -> bool:
@@ -805,11 +786,7 @@ def _persist_structured_estimate(
     total_str = f"${float(stored_total):,.2f}"
     unit_str = "$" + re.sub(r"(\.\d\d\d*?)0+$", r"\1", f"{unit_price:.5f}")
     qty_str = f"{int(qty):,}"
-    low_mat = mat.lower()
-    if "bopp" in low_mat:
-        short_mat = "White BOPP" if "white" in low_mat else "BOPP"
-    else:
-        short_mat = mat.split("/")[0].strip()
+    short_mat = re.sub(r"^\d+(\.\d+)?\s*mil\s*", "", mat.split("/")[0]).strip()
     material_line = ", ".join(part for part in (short_mat, fin.strip().lower()) if part)
     lines = ["Your quote is ready."]
     if w and h:
