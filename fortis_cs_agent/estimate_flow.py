@@ -28,13 +28,13 @@ from fortis_cs_agent.estimate_sessions import (
     update_estimate_session_status,
     upsert_estimate_session,
 )
-from fortis_cs_agent.knowledge import retrieve_pricing
+from fortis_cs_agent.knowledge import _extract_quantity, retrieve_pricing
 from fortis_cs_agent.tools import execute_agent_tool, quote_page_url
 
 logger = logging.getLogger(__name__)
 
 # Bumped when changing estimate wizard behavior; exposed on GET /health for deploy verification.
-ESTIMATE_FLOW_BUILD = "wizard-v15-name-slot-exact-size"
+ESTIMATE_FLOW_BUILD = "wizard-v16-comma-qty-quote-copy"
 
 _STEPS = ("product_details", "business_name", "contact_name", "email", "address")
 _DEFAULT_NOTES = "This quote does not include shipping or taxes. Prices are valid for 30 days."
@@ -77,25 +77,6 @@ def _qty_to_cost_key(qty: int) -> str:
     if qty >= 250:
         return "cost_250"
     return "cost_100"
-
-
-def _extract_quantity(text_lower: str) -> int | None:
-    for pat in (
-        r"\bquantity\s*(?:is|are|=|:)?\s*(\d{1,6})\b",
-        r"\bqty\s*(?:is|are|=|:)?\s*(\d{1,6})\b",
-        r"\b(\d{1,6})\s*(?:labels|units)\b",
-    ):
-        m = re.search(pat, text_lower)
-        if m:
-            q = int(m.group(1))
-            if 1 <= q <= 999_999:
-                return q
-    m = re.search(r"\b(\d{2,6})\b", text_lower)
-    if m:
-        q = int(m.group(1))
-        if 10 <= q <= 999_999:
-            return q
-    return None
 
 
 def _extract_dimensions(text_lower: str) -> bool:
@@ -270,7 +251,12 @@ def _wizard_quote_finished_in_history(history_rows: list[dict[str, Any]]) -> boo
         if row.get("role") != "assistant":
             continue
         c = row.get("content") or ""
-        if "### Pricing summary" in c or "Quick Ship** estimate has been saved" in c:
+        if (
+            "Your quote is ready." in c
+            or "couldn't price that one automatically" in c
+            or "### Pricing summary" in c
+            or "Quick Ship** estimate has been saved" in c
+        ):
             return True
         meta = _coerce_meta_outer(row.get("meta"))
         block = meta.get("estimate_flow")
@@ -529,7 +515,7 @@ def _address_field_issue(answer: str) -> str | None:
     return None
 
 
-_PRODUCT_SPEC_REASK = "That looks like label specs (size, core, or requirements). "
+_PRODUCT_SPEC_REASK = "That looks like a label spec, not a name. "
 
 
 def _invalid_business_name_reply(code: str, snippet: str) -> str:
@@ -561,7 +547,7 @@ def _invalid_business_name_reply(code: str, snippet: str) -> str:
 def _invalid_contact_name_reply(code: str, snippet: str) -> str:
     ack = f"You wrote **{snippet}** — " if snippet and snippet != "that" else ""
     if code == "empty":
-        lead = "I need a **contact name** for this order. "
+        lead = "I need a **contact name** for this quote. "
     elif code == "short":
         lead = ack + "please give at least **two characters** (a first name or full contact name). "
     elif code == "no_letters":
@@ -615,36 +601,6 @@ def _looks_like_email(s: str) -> bool:
     if ".." in s:
         return False
     return bool(_EMAIL_SYNTAX_RE.match(s))
-
-
-def _cost_key_human_label(cost_key: str) -> str:
-    tier = (
-        ("cost_100", "100-label"),
-        ("cost_250", "250-label"),
-        ("cost_500", "500-label"),
-        ("cost_1000", "1,000-label"),
-        ("cost_1500", "1,500-label"),
-        ("cost_2000", "2,000-label"),
-        ("cost_2500", "2,500-label"),
-        ("cost_3000", "3,000-label"),
-        ("cost_4000", "4,000-label"),
-        ("cost_5000", "5,000-label"),
-    )
-    for key, lab in tier:
-        if cost_key == key:
-            return lab
-    return cost_key.replace("cost_", "").replace("_", " ")
-
-
-def _catalog_match_sentence(row: dict[str, Any]) -> str | None:
-    tag = str(row.get("_fortis_pricing_match") or "").strip()
-    if tag in ("closest_size", "closest_fallback"):
-        return (
-            "**Closest match:** This total is driven by the **nearest available Quick Ship line** "
-            "in our pricing grid for your quantity and specs. Confirm the SKU and description on your quote page "
-            "before committing to production."
-        )
-    return None
 
 
 def latest_estimate_flow_snapshot(history_rows: list[dict[str, Any]]) -> tuple[dict[str, Any], int] | None:
@@ -728,14 +684,20 @@ def _prompt_for_pending_index(idx: int) -> str:
             "**finish**, and **print colors**."
         )
     if step == "business_name":
-        return "**Step 2/5:** What **business name** should appear on the quote? Reply **Individual** if personal."
+        return "**Step 2/5:** What business name should go on the quote? Reply Individual if it's personal."
     if step == "contact_name":
-        return "**Step 3/5:** What’s the **contact name** for this order?"
+        return "**Step 3/5:** What’s the **contact name** for this quote?"
     if step == "email":
         return "**Step 4/5:** What **email** should we use for your quote link?"
     if step == "address":
         return "**Step 5/5:** **Shipping/billing address** (one line), or reply **skip**."
     return ""
+
+
+_PRICE_UNAVAILABLE = (
+    "I couldn't price that one automatically. Double-check the size and quantity, "
+    "or ask for a custom quote and include your contact details."
+)
 
 
 def _persist_structured_estimate(
@@ -746,14 +708,7 @@ def _persist_structured_estimate(
     blob = draft.get("product_details") or ""
     pricing_rows = retrieve_pricing(str(blob), limit=5)
     if not pricing_rows:
-        return (
-            "Everything’s captured, but the catalog lookup returned no rows yet.\n\n"
-            "• Send one line again: **qty, WxH inches, material/finish/colors**\n\n"
-            "If this keeps happening, call **GET /health** on the API and check **pricing_health** — "
-            "`has_rows` should be true. If it is false, the Quick Ship pricing table is empty, the table name "
-            "does not match (set env **FORTIS_PRICING_TABLE**), or this deploy’s Supabase key cannot read that table.",
-            None,
-        )
+        return (_PRICE_UNAVAILABLE, None)
 
     row = pricing_rows[0]
     qty_hint = draft.get("_quantity_hint")
@@ -771,16 +726,16 @@ def _persist_structured_estimate(
     try:
         total_val = Decimal(str(raw_cost))
     except (InvalidOperation, TypeError, ValueError):
-        return ("Could not read a catalog total — please revisit quantity/tier selections.", None)
+        return (_PRICE_UNAVAILABLE, None)
 
     if total_val <= 0:
-        return ("Catalog returned a zero/blank total — double-check qty vs Quick Ship breakpoints.", None)
+        return (_PRICE_UNAVAILABLE, None)
 
     stored_total = total_val.quantize(Decimal("0.01"))
     unit_price = float(stored_total / int(qty))
     sku = (str(row.get("sku") or "").strip()) or "CATALOG_ROW"
     w, h = float(row.get("width_in") or 0), float(row.get("height_in") or 0)
-    quoted_size = f"Quoted size: {w:g} × {h:g} in."
+    quoted_size = f"Quoted size: {w:g} × {h:g} in." if w and h else ""
     desc_parts = [
         str(row.get("comment_application") or row.get("description") or "").strip(),
         quoted_size,
@@ -828,46 +783,19 @@ def _persist_structured_estimate(
     link = quote_page_url(eid)
     mat = str(row.get("material") or "").strip()
     fin = str(row.get("finish") or "").strip()
-    if mat and fin:
-        mat_fin = f"{mat}, {fin}"
-    elif mat:
-        mat_fin = mat
-    elif fin:
-        mat_fin = fin
-    else:
-        mat_fin = "See catalog row on quote"
-
     total_str = f"${float(stored_total):,.2f}"
     unit_str = "$" + re.sub(r"(\.\d\d\d*?)0+$", r"\1", f"{unit_price:.5f}")
     qty_str = f"{int(qty):,}"
-
-    tier_line = (
-        f"Catalog pricing tier applied: **{_cost_key_human_label(ck)}** bracket (matched to your requested quantity)."
-    )
-
-    match_txt = _catalog_match_sentence(row)
-    lines_note = f"\n\n{match_txt}" if match_txt else ""
-
-    friendly = (
-        "Thank you — your structured **Quick Ship** estimate has been saved. "
-        "Below is a concise pricing summary matched to our Quick Ship pricing grid.\n\n"
-        "### Pricing summary\n"
-        f"- **SKU:** `{sku}`\n"
-        f"- {quoted_size}\n"
-        f"- **Quantity:** {qty_str} labels\n"
-        f"- **Unit price:** {unit_str} per label (extended total shown below divided by qty)\n"
-        f"- **Line total:** {total_str}\n"
-        f"- **Material / finish (catalog row):** {mat_fin}\n"
-        f"- {tier_line}"
-        f"{lines_note}"
-        "\n\n### Your quote\n"
-        f"Here's your quote: {link}\n\n"
-        f"Quote reference · `{eid}`\n\n"
-        "**Terms:** Quote valid **30 days**; does **not** include shipping or taxes (same notes appear on your quote page).\n\n"
-        "If anything looks off versus what you typed, reply here before you place the order—we’re happy to double-check "
-        "the nearest catalog line or walk you through the next steps."
-    )
-    return friendly, eid
+    short_mat = re.sub(r"^\d+(\.\d+)?\s*mil\s*", "", mat.split("/")[0]).strip()
+    material_line = ", ".join(part for part in (short_mat, fin.strip().lower()) if part)
+    lines = ["Your quote is ready."]
+    if w and h:
+        lines.append(f"Size {w:g} × {h:g} in")
+    lines.append(f"Quantity {qty_str}")
+    if material_line:
+        lines.append(f"Material {material_line}")
+    lines.extend([f"Price {unit_str} each", f"Total {total_str}", link, f"Ref: {sku}", "Reply here with any questions."])
+    return "\n".join(lines), eid
 
 
 @dataclass(frozen=True)

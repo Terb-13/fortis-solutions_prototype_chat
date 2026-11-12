@@ -525,10 +525,7 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
         )
         try:
             res = supabase.table(tbl).select("*").or_(window).limit(max(limit * 4, 12)).execute()
-            exact = [
-                dict(r) for r in (res.data or [])
-                if _row_matches_size_tolerance(r, tw, th, exact_tol) or _row_matches_size_tolerance(r, th, tw, exact_tol)
-            ]
+            exact = [dict(r) for r in (res.data or [])]
             if exact:
                 return _annotate_pricing_rows(exact[:limit], query_lower, how="size", tol=tol)
         except Exception:
@@ -667,18 +664,20 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
     return []
 
 
-def _extract_quantity_from_query(query_lower: str) -> int | None:
+def _extract_quantity(text_lower: str) -> int | None:
+    text = re.sub(r"\b(\d{1,3})\s*k\b", lambda m: str(int(m.group(1)) * 1000), text_lower)
+    text = re.sub(r"\b(\d{1,3})[, ](\d{3})\b", r"\1\2", text)
     for pat in (
         r"\bquantity\s*(?:is|are|=|:)?\s*(\d{1,6})\b",
         r"\bqty\s*(?:is|are|=|:)?\s*(\d{1,6})\b",
         r"\b(\d{1,6})\s*(?:labels|units)\b",
     ):
-        m = re.search(pat, query_lower)
+        m = re.search(pat, text)
         if m:
             q = int(m.group(1))
             if 1 <= q <= 999_999:
                 return q
-    m = re.search(r"\b(\d{2,6})\b", query_lower)
+    m = re.search(r"\b(\d{2,6})\b", text)
     if m:
         q = int(m.group(1))
         if 10 <= q <= 999_999:
@@ -747,7 +746,7 @@ def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
         return ""
 
     query_lower = query.lower()
-    qty = _extract_quantity_from_query(query_lower)
+    qty = _extract_quantity(query_lower)
 
     qty_key = _qty_to_cost_key(qty) if qty is not None else "cost_1000"
 

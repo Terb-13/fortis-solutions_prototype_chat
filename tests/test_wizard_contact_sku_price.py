@@ -12,7 +12,7 @@ _NOTE = "roll labels, 3 inch core, no other requirements"
 _SPECS = "Price for 2x3 white BOPP labels, quantity 5000; gloss finish, CMYK"
 _ROWS = [
     {"sku": "STICKER_1.3438x3.4375_WBGP_G", "width_in": 1.3438, "height_in": 3.4375, "material": "White BOPP"},
-    {"sku": "STICKER_2x3_WBGP_G", "width_in": 2, "height_in": 3, "material": "White BOPP", "comment_application": "2x3", "cost_5000": "83.90"},
+    {"sku": "STICKER_2x3_WBGP_G", "width_in": 2, "height_in": 3, "material": "2.6mil White BOPP / GPX / 40# SCK", "finish": "Gloss", "comment_application": "2x3", "cost_5000": "83.90"},
 ]
 
 class _Query:
@@ -20,7 +20,13 @@ class _Query:
         self.rows, self.n = rows, len(rows)
     def select(self, *_a, **_k):
         return self
-    ilike = or_ = select
+    ilike = select
+    def or_(self, _filt):
+        def _hit(row):
+            w, h = float(row["width_in"]), float(row["height_in"])
+            return (abs(w - 2) <= 0.02 and abs(h - 3) <= 0.02) or (abs(w - 3) <= 0.02 and abs(h - 2) <= 0.02)
+        self.rows = [row for row in self.rows if _hit(row)]
+        return self
     def limit(self, n):
         self.n = n
         return self
@@ -61,3 +67,37 @@ class TestBadEstimateRegressions(unittest.TestCase):
             self.assertEqual(item["quantity"] * item["unit_price"], item["total"])
             self.assertEqual(item["total"], float(Decimal(cost)))
             self.assertIn("Quoted size: 2 × 3 in.", f"{reply}\n{item['description']}")
+
+
+class TestCommaQuantityAndPricingFailure(unittest.TestCase):
+    @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
+    @patch("fortis_cs_agent.estimate_flow.retrieve_pricing", return_value=[_ROWS[1]])
+    @patch("fortis_cs_agent.estimate_flow.execute_agent_tool")
+    def test_comma_quantity_prices_at_5000(self, tool, _pricing, _fetch):
+        from fortis_cs_agent.knowledge import _extract_quantity
+
+        self.assertEqual(_extract_quantity("5,000"), 5000)
+        self.assertEqual(_extract_quantity("5k"), 5000)
+        self.assertEqual(_extract_quantity("5 000"), 5000)
+        saved = {}
+        tool.side_effect = lambda _n, args, **_k: saved.update(item=args["items"][0]) or {"estimate_id": "00000000-0000-4000-8000-000000000099"}
+        history = []
+        for message in ("I need a quote on 5,000 white BOPP labels, 2x3 inches, gloss, CMYK", "Acme Packaging", "Sam Jones", "a@b.co", "skip"):
+            result = handle_estimate_flow(user_message=message, conversation_history=history, conversation_id=_CID)
+            history += [{"role": "user", "content": message}, {"role": "assistant", "content": result.reply, "meta": result.assistant_meta or {}}]
+        item = saved["item"]
+        self.assertEqual(item["total"], 83.9)
+        self.assertEqual(item["quantity"] * item["unit_price"], item["total"])
+
+    def test_pricing_failure_does_not_restart(self):
+        from fortis_cs_agent.estimate_flow import _PRICE_UNAVAILABLE
+
+        draft = {"product_details": "5000 2x3 white bopp gloss cmyk", "_quantity_hint": 5000, "business_name": "Acme", "contact_name": "Sam Jones", "email": "a@b.co"}
+        history = [{"role": "assistant", "content": "**Step 5/5:** address", "meta": {"estimate_flow": {"active": True, "version": 1, "pending_step_index": 4, "draft": draft}}}]
+        with patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None), patch("fortis_cs_agent.estimate_flow.retrieve_pricing", return_value=[{"sku": "X"}]):
+            failed = handle_estimate_flow(user_message="skip", conversation_history=history, conversation_id=_CID)
+        self.assertIn(_PRICE_UNAVAILABLE, failed.reply)
+        again = handle_estimate_flow(user_message="Acme Packaging", conversation_history=[{"role": "assistant", "content": "**Step 1/5:** specs"}, {"role": "user", "content": "5000 2x3 white bopp gloss cmyk"}, {"role": "assistant", "content": failed.reply}], conversation_id=_CID)
+        self.assertFalse(again.handled)
+        self.assertNotIn("Step 2/5", again.reply)
+
