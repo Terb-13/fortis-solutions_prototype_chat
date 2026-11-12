@@ -69,6 +69,45 @@ class TestBadEstimateRegressions(unittest.TestCase):
             self.assertEqual(item["description"], "2 × 3 in · White BOPP, gloss · CMYK")
 
 
+def _quantity_misses(n: int):
+    history, message, result = [], "I need a quote for 2x3 white bopp gloss cmyk", None
+    for _ in range(n):
+        result = handle_estimate_flow(user_message=message, conversation_history=history, conversation_id=_CID)
+        history += [{"role": "user", "content": message}, {"role": "assistant", "content": result.reply, "meta": result.assistant_meta}]
+        message = "I'm not sure yet"
+    return result
+
+
+class TestMidQuoteSizeChange(unittest.TestCase):
+    @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
+    def test_new_size_at_name_step(self, _fetch):
+        draft = {"product_details": "5000 2x3 white bopp gloss cmyk", "_quantity_hint": 5000, "sku": "STICKER_2x3_WBGP_G", "price": 1, "unit_price": 1, "total": 1}
+        result = _turn(1, draft, "and for 3x4 labels?")
+        spec = result.assistant_meta["estimate_flow"]["draft"]
+        self.assertNotIn("label spec", result.reply)
+        self.assertIn("3x4", spec["product_details"])
+        self.assertNotIn("2x3", spec["product_details"])
+        self.assertIn("5000", spec["product_details"])
+        self.assertIn("bopp", spec["product_details"])
+        self.assertFalse(any(k in spec for k in ("sku", "price", "unit_price", "total")))
+
+    @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
+    def test_third_quantity_miss(self, _fetch):
+        self.assertEqual(_quantity_misses(3).reply, "No problem. Whenever you have a number, send it here and I'll price it.")
+
+    @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
+    def test_fourth_quantity_miss_is_silent(self, _fetch):
+        result = _quantity_misses(4)
+        self.assertFalse(result.handled)
+        self.assertEqual(result.reply, "")
+
+    @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
+    def test_custom_quote_without_session(self, _fetch):
+        result = handle_estimate_flow(user_message="Can someone help me with a custom quote?", conversation_history=[], conversation_id=_CID)
+        self.assertEqual(result.reply, "Sure. Send the size, quantity, material and finish you need.")
+        self.assertNotIn("Step 1/5", result.reply)
+
+
 class TestSecondQuantityMiss(unittest.TestCase):
     @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
     def test_second_miss_does_not_repeat_step1(self, _fetch):

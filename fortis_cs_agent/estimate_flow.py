@@ -633,24 +633,25 @@ def latest_estimate_flow_snapshot(history_rows: list[dict[str, Any]]) -> tuple[d
     return _infer_snapshot_from_assistant_content(history_rows)
 
 
-def _step1_continue_reply(miss_txt: str, history: list[dict[str, Any]] | None = None) -> str:
-    """Step 1 partial progress. A second identical quantity ask uses the fallback."""
+def _step1_continue_reply(miss_txt: str, history: list[dict[str, Any]] | None = None) -> str | None:
+    """Step 1 partial progress. Each quantity wording is sent at most once."""
     reply = (
         f"**Step 1/5:** Thanks — I still need: {miss_txt}.\n\n"
         "Send what’s missing in one line (or another short line if that’s easier—I’ll combine them)."
     )
     if "**quantity**" not in miss_txt:
         return reply
-    last = ""
-    for row in reversed(history or []):
-        if row.get("role") == "assistant":
-            last = (row.get("content") or "").strip()
-            break
-    if last == reply.strip():
-        return (
-            "No problem. Most orders start at 1,000 labels. Send a number to price it."
-        )
-    return reply
+    n = 0
+    for row in history or []:
+        if row.get("role") == "user" and _extract_quantity((row.get("content") or "").lower()):
+            n = 0
+            continue
+        if row.get("role") != "assistant":
+            continue
+        text = (row.get("content") or "").strip()
+        if text in (_QTY_THOUSAND, _QTY_LATER) or ("**quantity**" in text and "still need" in text.lower()):
+            n += 1
+    return [reply, _QTY_THOUSAND, _QTY_LATER][n] if n < 3 else None
 
 
 def _resolve_wizard_snap(
@@ -710,8 +711,18 @@ def _prompt_for_pending_index(idx: int) -> str:
 
 _PRICE_UNAVAILABLE = (
     "I couldn't price that one automatically. Double-check the size and quantity, "
-    "or ask for a custom quote and include your contact details."
+    "or ask for a custom quote."
 )
+_QTY_THOUSAND = "No problem. Most orders start at 1,000 labels. Send a number to price it."
+_QTY_LATER = "No problem. Whenever you have a number, send it here and I'll price it."
+_CUSTOM_QUOTE_REPLY = "Sure. Send the size, quantity, material and finish you need."
+
+
+def _step1_miss_result(draft: dict[str, Any], miss_txt: str, history: list[dict[str, Any]]) -> EstimateFlowResult:
+    reply = _step1_continue_reply(miss_txt, history)
+    if reply is None:
+        return EstimateFlowResult(handled=False)
+    return EstimateFlowResult(handled=True, reply=reply, assistant_meta=_meta_payload(draft, 0), estimate_id=None)
 
 
 def _persist_structured_estimate(
@@ -889,6 +900,8 @@ def handle_estimate_flow(
 
     snap = _resolve_wizard_snap(conversation_id, conversation_history, session_row)
     carrying = snap is not None
+    if not carrying and re.search(r"\bcustom\s+quote\b", raw, re.IGNORECASE):
+        return EstimateFlowResult(handled=True, reply=_CUSTOM_QUOTE_REPLY)
 
     # Hard guard: never open the wizard on capability / refusal / SBU / general-topic openers.
     if not carrying and should_skip_estimate_wizard_opener(raw):
@@ -934,12 +947,7 @@ def handle_estimate_flow(
                 blob_low = str(labeled_draft.get("product_details") or "").lower()
                 if pi == 0 and not _step1_specs_complete(blob_low):
                     miss_txt = ", ".join(_step1_missing_parts(blob_low))
-                    return EstimateFlowResult(
-                        handled=True,
-                        reply=_step1_continue_reply(miss_txt, conversation_history),
-                        assistant_meta=_meta_payload(dict(labeled_draft), 0),
-                        estimate_id=None,
-                    )
+                    return _step1_miss_result(dict(labeled_draft), miss_txt, conversation_history)
                 return EstimateFlowResult(
                     handled=True,
                     reply=_prompt_for_pending_index(pi),
@@ -963,12 +971,7 @@ def handle_estimate_flow(
                     estimate_id=None,
                 )
             miss_txt = ", ".join(_step1_missing_parts(msg_lower))
-            return EstimateFlowResult(
-                handled=True,
-                reply=_step1_continue_reply(miss_txt, conversation_history),
-                assistant_meta=_meta_payload(draft, pending_step_index=0),
-                estimate_id=None,
-            )
+            return _step1_miss_result(draft, miss_txt, conversation_history)
 
         if not rich:
             if should_skip_estimate_wizard_opener(raw):
@@ -979,12 +982,7 @@ def handle_estimate_flow(
                 if qh:
                     draft["_quantity_hint"] = qh
                 miss_txt = ", ".join(_step1_missing_parts(msg_lower))
-                return EstimateFlowResult(
-                    handled=True,
-                    reply=_step1_continue_reply(miss_txt, conversation_history),
-                    assistant_meta=_meta_payload(draft, pending_step_index=0),
-                    estimate_id=None,
-                )
+                return _step1_miss_result(draft, miss_txt, conversation_history)
             if not _EXPLICIT_QUOTE_COLD_OPENER_RE.search(msg_lower):
                 return EstimateFlowResult(handled=False)
 
@@ -1033,6 +1031,22 @@ def handle_estimate_flow(
         )
 
     answer = raw.strip()
+    new_size = _extract_size_tuple(answer.lower())
+    old_size = _extract_size_tuple(str(draft.get("product_details") or "").lower())
+    if new_size and old_size and (abs(new_size[0] - old_size[0]) > 0.02 or abs(new_size[1] - old_size[1]) > 0.02):
+        for key in ("sku", "price", "unit_price", "total"):
+            draft.pop(key, None)
+        draft["product_details"] = re.sub(
+            r"(\d+(?:\.\d+)?)\s*(?:x|×|\bby\b)\s*(\d+(?:\.\d+)?)",
+            f"{new_size[0]:g}x{new_size[1]:g}",
+            str(draft["product_details"]),
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        fp = _first_pending_step_index(draft)
+        if fp == 0:
+            return _step1_miss_result(draft, ", ".join(_step1_missing_parts(str(draft["product_details"]).lower())), conversation_history)
+        return EstimateFlowResult(handled=True, reply=_prompt_for_pending_index(fp), assistant_meta=_meta_payload(draft, fp), estimate_id=None)
 
     if step_key == "product_details":
         if _looks_like_labeled_estimate_form(raw):
@@ -1054,12 +1068,7 @@ def handle_estimate_flow(
             fp2 = _first_pending_step_index(draft)
             if fp2 == 0 and not _step1_specs_complete(low):
                 miss_txt = ", ".join(_step1_missing_parts(low))
-                return EstimateFlowResult(
-                    handled=True,
-                    reply=_step1_continue_reply(miss_txt, conversation_history),
-                    assistant_meta=_meta_payload(draft, pending_step_index=0),
-                    estimate_id=None,
-                )
+                return _step1_miss_result(draft, miss_txt, conversation_history)
             if fp2 > 0:
                 return EstimateFlowResult(
                     handled=True,
@@ -1078,12 +1087,7 @@ def handle_estimate_flow(
                 draft["_quantity_hint"] = q
             if not _step1_specs_complete(low):
                 miss_txt = ", ".join(_step1_missing_parts(low))
-                return EstimateFlowResult(
-                    handled=True,
-                    reply=_step1_continue_reply(miss_txt, conversation_history),
-                    assistant_meta=_meta_payload(draft, pending_step_index=0),
-                    estimate_id=None,
-                )
+                return _step1_miss_result(draft, miss_txt, conversation_history)
     elif step_key == "business_name":
         issue = _business_name_field_issue(answer)
         if issue:
