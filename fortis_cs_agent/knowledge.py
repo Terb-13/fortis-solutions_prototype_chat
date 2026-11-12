@@ -525,10 +525,7 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
         )
         try:
             res = supabase.table(tbl).select("*").or_(window).limit(max(limit * 4, 12)).execute()
-            exact = [
-                dict(r) for r in (res.data or [])
-                if _row_matches_size_tolerance(r, tw, th, exact_tol) or _row_matches_size_tolerance(r, th, tw, exact_tol)
-            ]
+            exact = [dict(r) for r in (res.data or [])]
             if exact:
                 return _annotate_pricing_rows(exact[:limit], query_lower, how="size", tol=tol)
         except Exception:
@@ -668,22 +665,9 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
 
 
 def _extract_quantity_from_query(query_lower: str) -> int | None:
-    for pat in (
-        r"\bquantity\s*(?:is|are|=|:)?\s*(\d{1,6})\b",
-        r"\bqty\s*(?:is|are|=|:)?\s*(\d{1,6})\b",
-        r"\b(\d{1,6})\s*(?:labels|units)\b",
-    ):
-        m = re.search(pat, query_lower)
-        if m:
-            q = int(m.group(1))
-            if 1 <= q <= 999_999:
-                return q
-    m = re.search(r"\b(\d{2,6})\b", query_lower)
-    if m:
-        q = int(m.group(1))
-        if 10 <= q <= 999_999:
-            return q
-    return None
+    from fortis_cs_agent.estimate_flow import _extract_quantity
+
+    return _extract_quantity(query_lower)
 
 
 def _extract_size_tuple(query_lower: str) -> tuple[float, float] | None:
