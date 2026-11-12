@@ -648,8 +648,7 @@ def _step1_continue_reply(miss_txt: str, history: list[dict[str, Any]] | None = 
             break
     if last == reply.strip():
         return (
-            "No problem. Most orders start at 1,000 labels. "
-            "Send a number to price it, or ask for a custom quote and include your contact details."
+            "No problem. Most orders start at 1,000 labels. Send a number to price it."
         )
     return reply
 

@@ -83,7 +83,10 @@ class TestSecondQuantityMiss(unittest.TestCase):
             conversation_history=[{"role": "assistant", "content": first.reply, "meta": first.assistant_meta}],
             conversation_id=_CID,
         )
-        self.assertIn("Most orders start at 1,000 labels", second.reply)
+        self.assertEqual(
+            second.reply,
+            "No problem. Most orders start at 1,000 labels. Send a number to price it.",
+        )
         self.assertNotEqual(second.reply.strip(), first.reply.strip())
 
 
