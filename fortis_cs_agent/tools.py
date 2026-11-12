@@ -24,6 +24,23 @@ from fortis_cs_agent.store import EST_TABLE, save_estimate_snapshot, supabase as
 
 logger = logging.getLogger(__name__)
 
+# Public /quote/{id} pages are served by the portal app. PUBLIC_BASE_URL is the
+# chat API origin (PDF links under /estimate-pdf) and is not a quote host.
+PORTAL_QUOTE_ORIGIN = "https://fortis-solutions-group-portal-proto.vercel.app"
+
+
+def quote_page_url(estimate_id: str) -> str:
+    """Absolute public quote URL.
+
+    NEXT_PUBLIC_QUOTE_SITE_URL wins when set (local or alternate portal).
+    Otherwise links use PORTAL_QUOTE_ORIGIN. PUBLIC_BASE_URL is ignored so a
+    chat-host value cannot send shoppers to the FastAPI app, which has no
+    /quote route.
+    """
+    override = (os.getenv("NEXT_PUBLIC_QUOTE_SITE_URL") or "").strip().rstrip("/")
+    base = override or PORTAL_QUOTE_ORIGIN
+    return f"{base}/quote/{estimate_id}"
+
 
 def insert_fortis_estimate(
     conversation_id: str,
@@ -73,7 +90,10 @@ def insert_fortis_estimate(
 
     return {
         "estimate_id": estimate_id,
-        "message": f"Estimate created successfully. Share this link with the customer: /quote/{estimate_id}",
+        "message": (
+            "Estimate created successfully. Share this link with the customer: "
+            f"{quote_page_url(str(estimate_id))}"
+        ),
     }
 
 

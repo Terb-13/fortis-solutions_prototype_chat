@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -30,7 +29,7 @@ from fortis_cs_agent.estimate_sessions import (
     upsert_estimate_session,
 )
 from fortis_cs_agent.knowledge import retrieve_pricing
-from fortis_cs_agent.tools import execute_agent_tool
+from fortis_cs_agent.tools import execute_agent_tool, quote_page_url
 
 logger = logging.getLogger(__name__)
 
@@ -604,16 +603,6 @@ def _looks_like_email(s: str) -> bool:
     return bool(_EMAIL_SYNTAX_RE.match(s))
 
 
-def _quote_absolute_url(estimate_id: str) -> str:
-    pub = (
-        os.getenv("PUBLIC_BASE_URL")
-        or os.getenv("NEXT_PUBLIC_QUOTE_SITE_URL")
-        or ""
-    ).strip().rstrip("/")
-    tail = f"/quote/{estimate_id}"
-    return f"{pub}{tail}" if pub else tail
-
-
 def _cost_key_human_label(cost_key: str) -> str:
     tier = (
         ("cost_100", "100-label"),
@@ -818,7 +807,7 @@ def _persist_structured_estimate(
     eid = str((out or {}).get("estimate_id", "") or "").strip()
     if not eid:
         return ("Estimate save failed — no estimate id returned.", None)
-    link = _quote_absolute_url(eid)
+    link = quote_page_url(eid)
     mat = str(row.get("material") or "").strip()
     fin = str(row.get("finish") or "").strip()
     if mat and fin:
