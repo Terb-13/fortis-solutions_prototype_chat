@@ -349,6 +349,89 @@ def _row_matches_size_tolerance(row: dict[str, Any], tw: float, th: float, tol: 
     return abs(rw - tw) <= tol and abs(rh - th) <= tol
 
 
+# Tighter than the nearest-die window. A requested 2×3 must hit a 2×3 row
+# when one exists, including the swapped orientation (3×2 stored as W×H).
+_EXACT_SIZE_TOL_IN = 0.02
+
+
+def _row_dimensions(row: dict[str, Any]) -> tuple[float, float] | None:
+    try:
+        rw = float(row.get("width_in"))
+        rh = float(row.get("height_in"))
+    except (TypeError, ValueError):
+        return None
+    if rw <= 0 or rh <= 0:
+        return None
+    return rw, rh
+
+
+def _same_requested_size(row: dict[str, Any], tw: float, th: float, tol: float = _EXACT_SIZE_TOL_IN) -> bool:
+    """True when the catalog row is the requested size, either orientation."""
+    dims = _row_dimensions(row)
+    if dims is None:
+        return False
+    rw, rh = dims
+    direct = abs(rw - tw) <= tol and abs(rh - th) <= tol
+    swapped = abs(rw - th) <= tol and abs(rh - tw) <= tol
+    return direct or swapped
+
+
+def _finish_match_score(query_lower: str, finish: str) -> float:
+    fin = (finish or "").lower()
+    score = 0.0
+    for term in ("gloss", "matte", "satin", "laminate"):
+        if term in query_lower and term in fin:
+            score += 2.0
+    return score
+
+
+def _rank_exact_size_rows(rows: list[dict[str, Any]], query_lower: str) -> list[dict[str, Any]]:
+    """Among exact-size rows, prefer the requested material and finish."""
+    return sorted(
+        rows,
+        key=lambda r: (
+            -_material_match_score(query_lower, str(r.get("material") or "")),
+            -_finish_match_score(query_lower, str(r.get("finish") or "")),
+            str(r.get("sku") or ""),
+        ),
+    )
+
+
+def _fetch_size_window(width_val: float, height_val: float, *, tol: float, limit: int) -> list[dict[str, Any]]:
+    """Load catalog rows in a tight W×H window, checking both orientations."""
+    if not supabase:
+        return []
+    tbl = _fortis_pricing_table()
+    orientations = [(width_val, height_val)]
+    if abs(width_val - height_val) > tol:
+        orientations.append((height_val, width_val))
+    found: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for w, h in orientations:
+        try:
+            res = (
+                supabase.table(tbl)
+                .select("*")
+                .gte("width_in", w - tol)
+                .lte("width_in", w + tol)
+                .gte("height_in", h - tol)
+                .lte("height_in", h + tol)
+                .limit(max(limit * 4, 12))
+                .execute()
+            )
+        except Exception:
+            logger.warning("retrieve_pricing exact-size query failed w=%s h=%s", w, h, exc_info=True)
+            continue
+        for raw in res.data or []:
+            row = dict(raw)
+            key = _pricing_dedupe_key(row)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(row)
+    return found
+
+
 def _annotate_pricing_rows(
     rows: list[dict[str, Any]],
     query_lower: str,
@@ -515,7 +598,19 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
         except Exception:
             logger.warning("retrieve_pricing SKU lookup failed sku=%r", sku, exc_info=True)
 
-    # --- 2) Material ---
+    # Size before material. A material ILIKE (bopp/white/gloss) used to return
+    # the first handful of BOPP rows sorted by SKU, so "2x3 white BOPP" quoted
+    # STICKER_1.3438x3.4375_WBGP_G even though STICKER_2x3_WBGP_G is in the table.
+    size_tuple = _extract_size_tuple(query_lower)
+    if size_tuple:
+        tw, th = size_tuple
+        window = _fetch_size_window(tw, th, tol=_EXACT_SIZE_TOL_IN, limit=limit)
+        exact_rows = [r for r in window if _same_requested_size(r, tw, th, _EXACT_SIZE_TOL_IN)]
+        if exact_rows:
+            ranked = _rank_exact_size_rows(exact_rows, query_lower)
+            return _annotate_pricing_rows(ranked[:limit], query_lower, how="size", tol=tol)
+
+    # --- 2) Material (no size in the request — otherwise size matching owns the pick) ---
     results: list[dict[str, Any]] = []
     seen_mat: set[tuple[Any, ...]] = set()
 
@@ -527,6 +622,9 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
         seen_mat.add(dk)
         results.append(row)
         return len(results) >= limit
+
+    if size_tuple is not None:
+        mentioned_materials = []
 
     for material in mentioned_materials[:3]:
         try:

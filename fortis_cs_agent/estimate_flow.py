@@ -34,7 +34,7 @@ from fortis_cs_agent.tools import execute_agent_tool, quote_page_url
 logger = logging.getLogger(__name__)
 
 # Bumped when changing estimate wizard behavior; exposed on GET /health for deploy verification.
-ESTIMATE_FLOW_BUILD = "wizard-v14-topic-shift-no-echo"
+ESTIMATE_FLOW_BUILD = "wizard-v15-name-slot-exact-size"
 
 _STEPS = ("product_details", "business_name", "contact_name", "email", "address")
 _DEFAULT_NOTES = "This quote does not include shipping or taxes. Prices are valid for 30 days."
@@ -440,10 +440,12 @@ _EMAIL_SYNTAX_RE = re.compile(
 )
 
 # Whole-message patterns that are not usable legal / DBA business names.
+# "yes" is included: the business-name step accepted a bare yes/no and a later
+# contact-name step stored "yes" on estimate b0539f03 (conversation replay).
 _GIBBERISH_OR_META_ANSWER_RE = re.compile(
     r"(?i)^\s*("
     r"wtf|lol|lmfao|rofl|idk|idc|bruh|meh|ugh|eh|huh|hmm+|nm|nvm|"
-    r"n/?a|none|null|nothing|no\s*$|nah|yep|yea|yeah|sure|maybe|ok+|k\.?|"
+    r"n/?a|none|null|nothing|no|nah|nope|yep|yea|yeah|yes|sure|maybe|ok+|k\.?|skip|"
     r"asdf+|qwerty|foo|bar|xxx+|abc123|1234|test\s*123|"
     r"help|why|because|whatever|dunno|i\s*don'?t\s*know|guess|"
     r"idk\??|wth|ffs|omg"
@@ -454,8 +456,14 @@ _GIBBERISH_OR_META_ANSWER_RE = re.compile(
 _GIBBERISH_CONTACT_RE = re.compile(
     r"(?i)^\s*("
     r"wtf|lol|asdf|foo|bar|xxx|test|none|n/?a|idk|nobody|someone|anyone|meh|"
-    r"your\s+mom|admin|user|customer|sir|madam|dude|bro"
+    r"your\s+mom|admin|user|customer|sir|madam|dude|bro|"
+    r"yes|yep|yea|yeah|no|nope|nah|ok+|sure|skip"
     r")\s*[!?.]*\s*$"
+)
+
+# Company-shaped answers stay in the name slot even if they mention labels.
+_COMPANY_SUFFIX_RE = re.compile(
+    r"(?i)\b(incorporated|inc|l\.?l\.?c|llc|ltd|limited|corp|corporation|company|co)\b\.?"
 )
 
 
@@ -467,6 +475,56 @@ def _safe_ack_snippet(text: str, *, max_len: int = 72) -> str:
     if len(t) > max_len:
         return t[: max_len - 1] + "…"
     return t
+
+
+def _looks_like_product_requirement(answer: str) -> bool:
+    """
+    True when a name-step reply is still describing the label (core, roll, size),
+    not the business or the contact.
+
+    Conversation 99189173 answered the business-name prompt with
+    "roll labels, 3 inch core, no other requirements" and the contact-name
+    prompt with "yes". Those strings were stored on the estimate.
+    """
+    raw = (answer or "").strip()
+    if not raw or _COMPANY_SUFFIX_RE.search(raw):
+        return False
+    if re.search(r"(?i)\brequirements?\b", raw):
+        return True
+    if re.search(r"(?i)\b\d+(?:\.\d+)?\s*-?\s*inch(?:es)?\s+core\b", raw):
+        return True
+    if re.search(r"(?i)\broll\s+labels?\b", raw) and re.search(
+        r"(?i)\b(core|inch|size|qty|quantity)\b", raw
+    ):
+        return True
+    low = raw.lower()
+    if _extract_dimensions(low) and (
+        _STEP1_MATERIAL_RE.search(low) or re.search(r"\b(labels?|stickers?)\b", low)
+    ):
+        return True
+    if _extract_quantity(low) is not None and re.search(r"\b(labels?|stickers?)\b", low):
+        return True
+    return False
+
+
+def _product_requirement_on_name_reply(step_key: str) -> str:
+    if step_key == "contact_name":
+        return (
+            "I added that to the **product details** (roll, core, or other label specs). "
+            "I still need the **contact name** for this order.\n\n"
+            "**Step 3/5 (again):** What’s the **contact’s full name**?"
+        )
+    return (
+        "I added that to the **product details** (roll, core, or other label specs). "
+        "I still need the **business name** that should appear on the quote. "
+        "Reply **Individual** if it’s personal.\n\n"
+        "**Step 2/5 (again):** Which **business name** should we use on this paperwork?"
+    )
+
+
+def _keep_product_requirement_on_details(draft: dict[str, Any], answer: str) -> None:
+    prior = str(draft.get("product_details") or "").strip()
+    draft["product_details"] = _merge_step1_blob(prior, answer.strip())
 
 
 def _business_name_field_issue(answer: str) -> str | None:
@@ -622,6 +680,107 @@ def _cost_key_human_label(cost_key: str) -> str:
     return cost_key.replace("cost_", "").replace("_", " ")
 
 
+def _format_dim(value: float) -> str:
+    text = f"{value:.4f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _format_size_pair(width: float, height: float) -> str:
+    return f"{_format_dim(width)} × {_format_dim(height)} in."
+
+
+def _requested_size_pair(text: str) -> tuple[float, float] | None:
+    match = re.search(
+        r"(\d+(?:\.\d+)?)\s*(?:x|×|✕|╳|\*|by)\s*(\d+(?:\.\d+)?)",
+        (text or "").lower(),
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return float(match.group(1)), float(match.group(2))
+
+
+def _row_size_pair(row: dict[str, Any]) -> tuple[float, float] | None:
+    try:
+        width = float(row.get("width_in"))
+        height = float(row.get("height_in"))
+    except (TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def _sizes_equivalent(requested: tuple[float, float], actual: tuple[float, float], tol: float = 0.02) -> bool:
+    rw, rh = requested
+    aw, ah = actual
+    direct = abs(aw - rw) <= tol and abs(ah - rh) <= tol
+    swapped = abs(aw - rh) <= tol and abs(ah - rw) <= tol
+    return direct or swapped
+
+
+def _quoted_size_clause(row: dict[str, Any], product_blob: str) -> tuple[str, str]:
+    """
+    Return (summary bullet body, description fragment).
+
+    When the catalog row is a different size than the request, both strings
+    name the size actually being quoted.
+    """
+    actual = _row_size_pair(row)
+    if actual is None:
+        return "", ""
+    quoted = _format_size_pair(*actual)
+    requested = _requested_size_pair(product_blob)
+    if requested and not _sizes_equivalent(requested, actual):
+        asked = _format_size_pair(*requested)
+        summary = (
+            f"**Quoted size:** {quoted}. You asked for {asked}. "
+            f"This quote uses {quoted}, the nearest Quick Ship size in the catalog."
+        )
+        detail = f"Quoted size: {quoted} (requested {asked}; nearest Quick Ship size)"
+        return summary, detail
+    summary = f"**Quoted size:** {quoted}."
+    detail = f"Quoted size: {quoted}"
+    return summary, detail
+
+
+def unit_price_matching_total(total: Decimal, quantity: int) -> Decimal:
+    """
+    Smallest decimal unit price such that unit × quantity equals ``total``.
+
+    Catalog totals stay exact. Rounding the unit to 4 places turns
+    5,000 × $0.01544 ($77.20) into $0.0154, which multiplies back to $77.00.
+    """
+    qty = Decimal(int(quantity))
+    if qty <= 0:
+        raise ValueError("quantity must be positive")
+    unit = total / qty
+    for places in range(0, 12):
+        quantum = Decimal(1).scaleb(-places)
+        candidate = unit.quantize(quantum)
+        if candidate * qty == total:
+            return candidate
+    return unit
+
+
+def _json_number(amount: Decimal) -> float:
+    """JSON number that keeps the decimal text (0.01544 stays 0.01544)."""
+    return float(format(amount, "f"))
+
+
+def _format_unit_price(unit: Decimal) -> str:
+    text = format(unit, "f")
+    if "." in text:
+        whole, frac = text.split(".", 1)
+        frac = frac.rstrip("0")
+        if len(frac) < 2:
+            frac = frac.ljust(2, "0")
+        text = f"{whole}.{frac}"
+    else:
+        text = f"{text}.00"
+    return f"${text}"
+
+
 def _catalog_match_sentence(row: dict[str, Any]) -> str | None:
     tag = str(row.get("_fortis_pricing_match") or "").strip()
     if tag in ("closest_size", "closest_fallback"):
@@ -762,11 +921,15 @@ def _persist_structured_estimate(
     if total_val <= 0:
         return ("Catalog returned a zero/blank total — double-check qty vs Quick Ship breakpoints.", None)
 
-    unit_val = total_val / Decimal(int(qty))
+    stored_total = total_val.quantize(Decimal("0.01"))
+    unit_val = unit_price_matching_total(stored_total, int(qty))
     sku = (str(row.get("sku") or "").strip()) or "CATALOG_ROW"
+    product_blob = str(draft.get("product_details") or "").strip()
+    size_summary, size_detail = _quoted_size_clause(row, product_blob)
     desc_parts = [
         str(row.get("comment_application") or row.get("description") or "").strip(),
-        str(draft.get("product_details") or "").strip(),
+        size_detail,
+        product_blob,
     ]
     desc = " | ".join(p for p in desc_parts if p)[:650]
 
@@ -775,8 +938,8 @@ def _persist_structured_estimate(
             "sku": sku[:240],
             "description": desc,
             "quantity": float(qty),
-            "unit_price": float(unit_val.quantize(Decimal("0.0001"))),
-            "total": float(total_val.quantize(Decimal("0.01"))),
+            "unit_price": _json_number(unit_val),
+            "total": _json_number(stored_total),
         }
     ]
 
@@ -819,8 +982,8 @@ def _persist_structured_estimate(
     else:
         mat_fin = "See catalog row on quote"
 
-    total_str = f"${float(total_val):,.2f}"
-    unit_str = f"${float(unit_val.quantize(Decimal('0.0001'))):,.4f}"
+    total_str = f"${float(stored_total):,.2f}"
+    unit_str = _format_unit_price(unit_val)
     qty_str = f"{int(qty):,}"
 
     tier_line = (
@@ -829,12 +992,14 @@ def _persist_structured_estimate(
 
     match_txt = _catalog_match_sentence(row)
     lines_note = f"\n\n{match_txt}" if match_txt else ""
+    size_line = f"- {size_summary}\n" if size_summary else ""
 
     friendly = (
         "Thank you — your structured **Quick Ship** estimate has been saved. "
         "Below is a concise pricing summary matched to our Quick Ship pricing grid.\n\n"
         "### Pricing summary\n"
         f"- **SKU:** `{sku}`\n"
+        f"{size_line}"
         f"- **Quantity:** {qty_str} labels\n"
         f"- **Unit price:** {unit_str} per label (extended total shown below divided by qty)\n"
         f"- **Line total:** {total_str}\n"
@@ -1129,6 +1294,13 @@ def handle_estimate_flow(
                     estimate_id=None,
                 )
     elif step_key == "business_name":
+        if _looks_like_product_requirement(answer):
+            _keep_product_requirement_on_details(draft, answer)
+            return EstimateFlowResult(
+                handled=True,
+                reply=_product_requirement_on_name_reply(step_key),
+                assistant_meta=_meta_payload(draft, pending_idx),
+            )
         issue = _business_name_field_issue(answer)
         if issue:
             sn = _safe_ack_snippet(answer)
@@ -1139,6 +1311,13 @@ def handle_estimate_flow(
             )
         draft["business_name"] = answer
     elif step_key == "contact_name":
+        if _looks_like_product_requirement(answer):
+            _keep_product_requirement_on_details(draft, answer)
+            return EstimateFlowResult(
+                handled=True,
+                reply=_product_requirement_on_name_reply(step_key),
+                assistant_meta=_meta_payload(draft, pending_idx),
+            )
         issue = _contact_name_field_issue(answer)
         if issue:
             sn = _safe_ack_snippet(answer)
