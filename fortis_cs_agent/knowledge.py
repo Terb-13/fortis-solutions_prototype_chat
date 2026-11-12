@@ -281,43 +281,6 @@ def _user_mentioned_material(query_lower: str) -> bool:
     return False
 
 
-def _pick_nearest_size_diverse_materials(
-    candidates: list[dict[str, Any]],
-    *,
-    width_val: float,
-    height_val: float,
-    limit: int,
-) -> list[dict[str, Any]]:
-    """Prefer smallest size delta; include multiple rows so different materials appear."""
-
-    def _dist(row: dict[str, Any]) -> float:
-        try:
-            rw = float(row.get("width_in") or 0)
-            rh = float(row.get("height_in") or 0)
-        except (TypeError, ValueError):
-            return 9999.0
-        return abs(rw - width_val) + abs(rh - height_val)
-
-    sorted_all = sorted(candidates, key=_dist)
-    picked: list[dict[str, Any]] = []
-    seen_material: set[str] = set()
-
-    for row in sorted_all:
-        mat_key = (row.get("material") or "").strip().lower()[:120] or "__unknown__"
-        if mat_key not in seen_material:
-            seen_material.add(mat_key)
-            picked.append(row)
-            if len(picked) >= limit:
-                return picked
-
-    for row in sorted_all:
-        if row not in picked:
-            picked.append(row)
-        if len(picked) >= limit:
-            break
-    return picked
-
-
 def _material_match_score(query_lower: str, material: str) -> float:
     """Rough overlap score for ranking catalog materials against user text."""
     if not material:
@@ -411,7 +374,6 @@ def _closest_pricing_fallback(query_lower: str, limit: int) -> list[dict[str, An
 
     tbl = _fortis_pricing_table()
     mentioned_materials = sorted({m for m in _MATERIAL_HINT_TERMS if m in query_lower})
-    size_tuple = _extract_size_tuple(query_lower)
     pool: list[dict[str, Any]] = []
     seen: set[tuple[Any, ...]] = set()
 
@@ -451,33 +413,6 @@ def _closest_pricing_fallback(query_lower: str, limit: int) -> list[dict[str, An
             tbl,
         )
         return []
-
-    if size_tuple:
-        tw, th = size_tuple
-
-        def _distance(row: dict[str, Any]) -> float:
-            try:
-                rw = float(row.get("width_in") or 0)
-                rh = float(row.get("height_in") or 0)
-            except (TypeError, ValueError):
-                return 9999.0
-            return abs(rw - tw) + abs(rh - th)
-
-        ranked = _pick_nearest_size_diverse_materials(
-            pool,
-            width_val=tw,
-            height_val=th,
-            limit=max(limit * 4, limit),
-        )
-        if mentioned_materials:
-            ranked = sorted(
-                ranked,
-                key=lambda r: (
-                    -_material_match_score(query_lower, str(r.get("material") or "")),
-                    _distance(r),
-                ),
-            )
-        return ranked[:limit]
 
     ranked = sorted(
         pool,
@@ -530,6 +465,7 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
                 return _annotate_pricing_rows(exact[:limit], query_lower, how="size", tol=tol)
         except Exception:
             logger.warning("retrieve_pricing exact-size query failed", exc_info=True)
+        return []
 
     # --- 2) Material (skipped when a size was requested) ---
     results: list[dict[str, Any]] = []
@@ -567,62 +503,6 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
 
         if results:
             return _annotate_pricing_rows(results[:limit], query_lower, how="material", tol=tol)
-
-    # --- 3) Size bucket + nearest-match (WxH × by) ---
-    size_tuple_pre = _extract_size_tuple(query_lower)
-    if size_tuple_pre:
-        width_val, height_val = size_tuple_pre
-        try:
-            tight = (
-                supabase.table(tbl)
-                .select("*")
-                .gte("width_in", width_val - tol)
-                .lte("width_in", width_val + tol)
-                .gte("height_in", height_val - tol)
-                .lte("height_in", height_val + tol)
-                .limit(max(limit * 4, 12))
-                .execute()
-            )
-            candidates = list(tight.data or [])
-            if not candidates:
-                broad = supabase.table(tbl).select("*").limit(150).execute()
-                candidates = list(broad.data or [])
-        except Exception:
-            logger.warning("retrieve_pricing size-bucket query failed", exc_info=True)
-            candidates = []
-        if not candidates:
-            try:
-                broad = supabase.table(tbl).select("*").limit(150).execute()
-                candidates = list(broad.data or [])
-            except Exception:
-                logger.warning("retrieve_pricing broad fetch failed", exc_info=True)
-                candidates = []
-
-        def _distance(row: dict[str, Any]) -> float:
-            try:
-                rw = float(row.get("width_in") or 0)
-                rh = float(row.get("height_in") or 0)
-            except (TypeError, ValueError):
-                return 9999.0
-            return abs(rw - width_val) + abs(rh - height_val)
-
-        size_ranked = _pick_nearest_size_diverse_materials(
-            candidates,
-            width_val=width_val,
-            height_val=height_val,
-            limit=limit,
-        )
-        if mentioned_materials:
-            size_ranked = sorted(
-                size_ranked,
-                key=lambda r: (
-                    -_material_match_score(query_lower, str(r.get("material") or "")),
-                    _distance(r),
-                ),
-            )
-        sliced = [dict(r) for r in size_ranked[:limit]]
-        if sliced:
-            return _annotate_pricing_rows(sliced, query_lower, how="size", tol=tol)
 
     # --- 4) Keywords OR ---
     results = []

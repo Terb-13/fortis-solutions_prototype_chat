@@ -28,13 +28,13 @@ from fortis_cs_agent.estimate_sessions import (
     update_estimate_session_status,
     upsert_estimate_session,
 )
-from fortis_cs_agent.knowledge import _extract_quantity, retrieve_pricing
+from fortis_cs_agent.knowledge import _extract_quantity, _extract_size_tuple, retrieve_pricing
 from fortis_cs_agent.tools import execute_agent_tool, quote_page_url
 
 logger = logging.getLogger(__name__)
 
 # Bumped when changing estimate wizard behavior; exposed on GET /health for deploy verification.
-ESTIMATE_FLOW_BUILD = "wizard-v16-comma-qty-quote-copy"
+ESTIMATE_FLOW_BUILD = "wizard-v17-exact-size-min-tier"
 
 _STEPS = ("product_details", "business_name", "contact_name", "email", "address")
 _DEFAULT_NOTES = "This quote does not include shipping or taxes. Prices are valid for 30 days."
@@ -57,7 +57,10 @@ _EXPLICIT_QUOTE_COLD_OPENER_RE = re.compile(
 )
 
 
-def _qty_to_cost_key(qty: int) -> str:
+def _qty_to_cost_key(qty: int) -> str | None:
+    """Map a quantity onto a real bracket. Below 100 there is no tier."""
+    if qty < 100:
+        return None
     if qty >= 5000:
         return "cost_5000"
     if qty >= 4000:
@@ -539,8 +542,7 @@ def _invalid_business_name_reply(code: str, snippet: str) -> str:
 
     return (
         f"{body}"
-        "Please send the **legal name, DBA, or brand** that should appear on the quote—or reply **Individual** if it’s personal.\n\n"
-        "**Step 2/5 (again):** Which **business name** should we use on this paperwork?"
+        "**Step 2/5 (again):** What business name should go on the quote? Reply Individual if it's personal."
     )
 
 
@@ -711,18 +713,16 @@ def _persist_structured_estimate(
         return (_PRICE_UNAVAILABLE, None)
 
     row = pricing_rows[0]
+    if _extract_size_tuple(str(blob).lower()) is None:
+        return (_PRICE_UNAVAILABLE, None)
     qty_hint = draft.get("_quantity_hint")
     qty = int(qty_hint) if isinstance(qty_hint, int) else _extract_quantity(str(blob).lower())
-    qty = qty or 1000
-
+    if not qty:
+        return (_PRICE_UNAVAILABLE, None)
     ck = _qty_to_cost_key(qty)
-    raw_cost = row.get(ck)
+    raw_cost = row.get(ck) if ck else None
     if raw_cost is None:
-        for alt in ("cost_1000", "cost_500", "cost_250", "cost_100"):
-            if row.get(alt) is not None:
-                ck = alt
-                raw_cost = row.get(alt)
-                break
+        return (_PRICE_UNAVAILABLE, None)
     try:
         total_val = Decimal(str(raw_cost))
     except (InvalidOperation, TypeError, ValueError):
