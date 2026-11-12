@@ -830,7 +830,7 @@ def _persist_structured_estimate(
     return "\n".join(lines), eid
 
 
-@dataclass(frozen=True)
+@dataclass
 class EstimateFlowResult:
     handled: bool
     reply: str = ""
@@ -1062,7 +1062,7 @@ def handle_estimate_flow(
         q = _extract_quantity(rest.lower()) if rest else None
         if q:
             draft["_quantity_hint"] = q
-        note = f"Got it, updated to {new_size[0]:g} × {new_size[1]:g} in" + (f", {q:,} labels" if q else "") + ".\n\n"
+        note = f"Got it, updated to {new_size[0]:g} × {new_size[1]:g} in" + (f", {q:,} labels" if q else "") + "."
         low = str(draft["product_details"]).lower()
         fp = _first_pending_step_index(draft)
         followed = (
@@ -1070,7 +1070,10 @@ def handle_estimate_flow(
             if fp == 0
             else EstimateFlowResult(handled=True, reply=_prompt_for_pending_index(fp), assistant_meta=_meta_payload(draft, fp), estimate_id=None)
         )
-        return EstimateFlowResult(handled=followed.handled, reply=note + (followed.reply or ""), assistant_meta=followed.assistant_meta, estimate_id=None)
+        if not followed.handled:
+            return followed
+        followed.reply = note + "\n\n" + followed.reply
+        return followed
 
     if step_key == "product_details":
         if _looks_like_labeled_estimate_form(raw):
