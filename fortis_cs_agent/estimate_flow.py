@@ -650,7 +650,7 @@ def _step1_continue_reply(miss_txt: str, history: list[dict[str, Any]] | None = 
             continue
         text = (row.get("content") or "").strip()
         flow = _coerce_meta_outer(row.get("meta")).get("estimate_flow")
-        if (isinstance(flow, dict) and flow.get("active") is False) or "collect a quote" in text:
+        if isinstance(flow, dict) and flow.get("active") is False:
             n = 0
             continue
         if text in (_QTY_THOUSAND, _QTY_LATER) or ("**quantity**" in text and "still need" in text.lower()):

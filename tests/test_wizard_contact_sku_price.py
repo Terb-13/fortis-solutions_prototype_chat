@@ -116,6 +116,7 @@ class TestMidQuoteSizeChange(unittest.TestCase):
             history += [{"role": "user", "content": message}, {"role": "assistant", "content": result.reply, "meta": result.assistant_meta}]
             message = "I'm not sure yet"
         cancelled = handle_estimate_flow(user_message="cancel", conversation_history=history, conversation_id=_CID)
+        self.assertIs(cancelled.assistant_meta["estimate_flow"]["active"], False)
         history += [{"role": "user", "content": "cancel"}, {"role": "assistant", "content": cancelled.reply, "meta": cancelled.assistant_meta}]
         fresh = handle_estimate_flow(user_message="I need a quote for 2x3 white bopp gloss cmyk", conversation_history=history, conversation_id=_CID)
         self.assertIn("still need", fresh.reply.lower())
