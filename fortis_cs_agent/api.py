@@ -38,7 +38,13 @@ from fortis_cs_agent.knowledge import (
 )
 from fortis_cs_agent.prompts import render_system_prompt
 from fortis_cs_agent.store import load_estimate_snapshot
-from fortis_cs_agent.tools import AGENT_TOOLS, assemble_estimate_result, create_estimate, execute_agent_tool
+from fortis_cs_agent.tools import (
+    AGENT_TOOLS,
+    assemble_estimate_result,
+    create_estimate,
+    execute_agent_tool,
+    quote_page_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -523,12 +529,6 @@ def _sanitize_history(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return msgs
 
 
-def _quote_view_absolute_url(estimate_id: str) -> str:
-    pub = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
-    tail = f"/quote/{estimate_id}"
-    return f"{pub}{tail}" if pub else tail
-
-
 async def persist_estimate_from_assistant_json(
     raw_reply: str,
     *,
@@ -570,7 +570,7 @@ async def persist_estimate_from_assistant_json(
         )
 
     qid = str(out.get("estimate_id", "")).strip()
-    link = _quote_view_absolute_url(qid)
+    link = quote_page_url(qid)
     friendly = (
         f"Estimate saved.\n\n"
         f"View your quote: {link}\n"
