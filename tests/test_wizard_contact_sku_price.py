@@ -4,8 +4,13 @@ import unittest
 from decimal import Decimal
 from unittest.mock import patch
 
-from fortis_cs_agent.estimate_flow import _PRICE_UNAVAILABLE, _persist_structured_estimate, handle_estimate_flow
-from fortis_cs_agent.knowledge import retrieve_pricing
+from fortis_cs_agent.estimate_flow import (
+    _PRICE_UNAVAILABLE,
+    _persist_structured_estimate,
+    handle_estimate_flow,
+    sync_wizard_session_from_result,
+)
+from fortis_cs_agent.knowledge import _extract_quantity, retrieve_pricing
 
 _CID = "00000000-0000-4000-8000-000000000581"
 _NOTE = "roll labels, 3 inch core, no other requirements"
@@ -69,43 +74,117 @@ class TestBadEstimateRegressions(unittest.TestCase):
             self.assertEqual(item["description"], "2 × 3 in · White BOPP, gloss · CMYK")
 
 
-def _quantity_misses(n: int):
-    history, message, result = [], "I need a quote for 2x3 white bopp gloss cmyk", None
-    for _ in range(n):
-        result = handle_estimate_flow(user_message=message, conversation_history=history, conversation_id=_CID)
-        history += [{"role": "user", "content": message}, {"role": "assistant", "content": result.reply, "meta": result.assistant_meta}]
-        message = "I'm not sure yet"
-    return result
-
-
 class TestMidQuoteSizeChange(unittest.TestCase):
     @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
-    def test_new_size_at_name_step(self, _fetch):
-        draft = {"product_details": "5000 2x3 white bopp gloss cmyk", "_quantity_hint": 5000, "sku": "STICKER_2x3_WBGP_G", "price": 1, "unit_price": 1, "total": 1}
-        result = _turn(1, draft, "and for 3x4 labels?")
+    @patch("fortis_cs_agent.estimate_flow.retrieve_pricing")
+    @patch("fortis_cs_agent.estimate_flow.execute_agent_tool")
+    def test_name_step_takes_new_size_and_quantity(self, tool, pricing, _fetch):
+        pricing.return_value = [{
+            "sku": "STICKER_3x2_WBGP_G", "width_in": 3, "height_in": 2,
+            "material": "2.6mil White BOPP / GPX / 40# SCK", "finish": "Gloss",
+            "cost_2000": "40.00", "cost_5000": "83.90",
+        }]
+        saved = {}
+        tool.side_effect = lambda _n, args, **_k: saved.update(item=args["items"][0]) or {"estimate_id": "00000000-0000-4000-8000-000000000099"}
+        draft = {"product_details": "5000 2x3 white bopp gloss cmyk", "_quantity_hint": 5000, "sku": "STICKER_2x3_WBGP_G", "total": 83.9}
+        result = _turn(1, draft, "actually 3x2, quantity 2000")
         spec = result.assistant_meta["estimate_flow"]["draft"]
-        self.assertNotIn("label spec", result.reply)
-        self.assertIn("3x4", spec["product_details"])
+        self.assertIn("3x2", spec["product_details"])
         self.assertNotIn("2x3", spec["product_details"])
-        self.assertIn("5000", spec["product_details"])
-        self.assertIn("bopp", spec["product_details"])
-        self.assertFalse(any(k in spec for k in ("sku", "price", "unit_price", "total")))
+        self.assertIn("2000", spec["product_details"])
+        history = [{"role": "assistant", "content": result.reply, "meta": result.assistant_meta}]
+        for message in ("Acme Packaging", "Sam Jones", "a@b.co", "skip"):
+            result = handle_estimate_flow(user_message=message, conversation_history=history, conversation_id=_CID)
+            history += [{"role": "user", "content": message}, {"role": "assistant", "content": result.reply, "meta": result.assistant_meta or {}}]
+        self.assertEqual(saved["item"]["quantity"], 2000)
+        self.assertNotEqual(saved["item"]["total"], 83.9)
 
     @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
-    def test_third_quantity_miss(self, _fetch):
-        self.assertEqual(_quantity_misses(3).reply, "No problem. Whenever you have a number, send it here and I'll price it.")
+    def test_by_size_keeps_old_quantity(self, _fetch):
+        draft = {"product_details": "5000 2x3 white bopp gloss cmyk", "_quantity_hint": 5000}
+        result = _turn(1, draft, "actually 12 by 18")
+        blob = result.assistant_meta["estimate_flow"]["draft"]["product_details"].lower()
+        self.assertEqual(_extract_quantity(blob), 5000)
+        self.assertIn("12x18", blob)
 
     @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
-    def test_fourth_quantity_miss_is_silent(self, _fetch):
-        result = _quantity_misses(4)
-        self.assertFalse(result.handled)
-        self.assertEqual(result.reply, "")
+    def test_quantity_nags_reset_after_cancel(self, _fetch):
+        history, message, result = [], "I need a quote for 2x3 white bopp gloss cmyk", None
+        for _ in range(4):
+            result = handle_estimate_flow(user_message=message, conversation_history=history, conversation_id=_CID)
+            history += [{"role": "user", "content": message}, {"role": "assistant", "content": result.reply, "meta": result.assistant_meta}]
+            message = "I'm not sure yet"
+        cancelled = handle_estimate_flow(user_message="cancel", conversation_history=history, conversation_id=_CID)
+        self.assertIs(cancelled.assistant_meta["estimate_flow"]["active"], False)
+        history += [{"role": "user", "content": "cancel"}, {"role": "assistant", "content": cancelled.reply, "meta": cancelled.assistant_meta}]
+        fresh = handle_estimate_flow(user_message="I need a quote for 2x3 white bopp gloss cmyk", conversation_history=history, conversation_id=_CID)
+        self.assertIn("still need", fresh.reply.lower())
+        self.assertIn("**quantity**", fresh.reply)
+        self.assertNotIn("Whenever you have a number", fresh.reply)
+
+    @patch("fortis_cs_agent.estimate_flow.execute_agent_tool")
+    @patch("fortis_cs_agent.estimate_flow.retrieve_pricing")
+    @patch("fortis_cs_agent.estimate_flow.upsert_estimate_session")
+    @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session")
+    def test_size_after_nags_is_the_quoted_size(self, fetch, upsert, pricing, tool):
+        stored = {"product_details": "2x3 white bopp gloss cmyk"}
+        fetch.side_effect = lambda _cid: {"status": "in_progress", "collected_data": dict(stored)}
+        def _save(_cid, **kwargs):
+            stored.clear()
+            stored.update(kwargs["collected_data"])
+        upsert.side_effect = _save
+        pricing.side_effect = lambda query, limit=5: [{
+            "sku": "STICKER_3x4_WBGP_G" if "3x4" in query else "STICKER_2x3_WBGP_G",
+            "width_in": 3 if "3x4" in query else 2, "height_in": 4 if "3x4" in query else 3,
+            "material": "2.6mil White BOPP / GPX / 40# SCK", "finish": "Gloss", "cost_5000": "120.00" if "3x4" in query else "83.90",
+        }]
+        saved = {}
+        tool.side_effect = lambda _n, args, **_k: saved.update(item=args["items"][0]) or {"estimate_id": "00000000-0000-4000-8000-000000000099"}
+        history = []
+        for text in (
+            "**Step 1/5:** Thanks — I still need: **quantity**.",
+            "No problem. Most orders start at 1,000 labels. Send a number to price it.",
+            "No problem. Whenever you have a number, send it here and I'll price it.",
+        ):
+            history += [{"role": "user", "content": "not sure"}, {"role": "assistant", "content": text}]
+        switched = handle_estimate_flow(user_message="3x4", conversation_history=history, conversation_id=_CID)
+        self.assertFalse(switched.handled)
+        self.assertIn("3x4", stored["product_details"])
+        history += [{"role": "user", "content": "3x4"}, {"role": "assistant", "content": "Got it, switching to 3x4"}]
+        result = None
+        for message in ("5000", "Acme Packaging", "Sam Jones", "a@b.co", "skip"):
+            result = handle_estimate_flow(user_message=message, conversation_history=history, conversation_id=_CID)
+            if result.handled:
+                sync_wizard_session_from_result(conversation_id=_CID, result=result)
+            history += [{"role": "user", "content": message}, {"role": "assistant", "content": result.reply, "meta": result.assistant_meta or {}}]
+        self.assertEqual(saved["item"]["sku"], "STICKER_3x4_WBGP_G")
+        self.assertNotEqual(saved["item"]["total"], 83.9)
 
     @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
-    def test_custom_quote_without_session(self, _fetch):
-        result = handle_estimate_flow(user_message="Can someone help me with a custom quote?", conversation_history=[], conversation_id=_CID)
-        self.assertEqual(result.reply, "Sure. Send the size, quantity, material and finish you need.")
-        self.assertNotIn("Step 1/5", result.reply)
+    def test_address_step_size_change_still_asks_for_address(self, _fetch):
+        draft = {
+            "product_details": "5000 2x3 white bopp gloss cmyk",
+            "_quantity_hint": 5000,
+            "business_name": "Acme",
+            "contact_name": "Sam Jones",
+            "email": "a@b.co",
+        }
+        result = _turn(4, draft, "actually 3x4")
+        self.assertIsNone(result.estimate_id)
+        self.assertIn("Step 5/5", result.reply)
+        self.assertNotIn("Your quote is ready", result.reply)
+        self.assertIn("3x4", result.assistant_meta["estimate_flow"]["draft"]["product_details"])
+
+    @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
+    def test_quantity_then_size_does_not_reask(self, _fetch):
+        first = _turn(0, {"product_details": "2x3 white bopp gloss cmyk"}, "5000")
+        second = handle_estimate_flow(
+            user_message="3x4",
+            conversation_history=[{"role": "assistant", "content": first.reply, "meta": first.assistant_meta}],
+            conversation_id=_CID,
+        )
+        self.assertNotIn("**quantity**", second.reply)
+        self.assertEqual(second.assistant_meta["estimate_flow"]["draft"]["_quantity_hint"], 5000)
 
 
 class TestSecondQuantityMiss(unittest.TestCase):
