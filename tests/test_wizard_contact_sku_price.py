@@ -122,6 +122,32 @@ class TestSecondQuantityMiss(unittest.TestCase):
         )
         self.assertNotEqual(second.reply.strip(), first.reply.strip())
 
+    @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
+    def test_third_quantity_miss_is_sent_once(self, _fetch):
+        history: list[dict] = []
+        message = "I need a quote for 2x3 white bopp gloss cmyk"
+        replies: list[str] = []
+        for _ in range(4):
+            result = handle_estimate_flow(
+                user_message=message,
+                conversation_history=history,
+                conversation_id=_CID,
+            )
+            replies.append(result.reply)
+            if result.handled:
+                history += [
+                    {"role": "user", "content": message},
+                    {"role": "assistant", "content": result.reply, "meta": result.assistant_meta},
+                ]
+            message = "I'm not sure yet"
+        later = "No problem. Whenever you have a number, send it here and I'll price it."
+        self.assertEqual(replies[2], later)
+        self.assertEqual(replies.count(later), 1)
+        self.assertNotEqual(replies[0], replies[1])
+        self.assertNotIn("**quantity**", replies[3])
+        self.assertNotIn(later, replies[3])
+        self.assertNotIn("1,000 labels", replies[3])
+
 
 class TestCommaQuantityAndPricingFailure(unittest.TestCase):
     @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)

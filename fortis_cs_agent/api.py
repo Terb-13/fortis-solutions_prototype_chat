@@ -647,7 +647,6 @@ async def run_agent_turn(
         elif pricing_intent:
             knowledge_context = (
                 "Do not quote a price. Ask the shopper for the size and quantity they need. "
-                "They can include contact details with that. "
                 "Stay on pressure-sensitive labels. Never invent dollars."
             )
         else:
