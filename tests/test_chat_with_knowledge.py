@@ -101,6 +101,29 @@ class TestRunAgentTurnKnowledge(unittest.IsolatedAsyncioTestCase):
         # User message went through unaugmented.
         self.assertEqual(last_user_msg, "tell me about something obscure")
 
+    @patch("fortis_cs_agent.api._grok_chat", new_callable=AsyncMock)
+    @patch("fortis_cs_agent.api.retrieve_faq")
+    @patch("fortis_cs_agent.api.retrieve_knowledge")
+    @patch("fortis_cs_agent.api.retrieve_pricing")
+    @patch("fortis_cs_agent.api.load_recent_messages")
+    async def test_pricing_question_without_size_gets_no_catalog_rows(
+        self,
+        load_msgs: MagicMock,
+        ret_pricing: MagicMock,
+        ret_kn: MagicMock,
+        ret_faq: MagicMock,
+        grok: AsyncMock,
+    ) -> None:
+        from fortis_cs_agent.api import run_agent_turn
+
+        load_msgs.return_value = []
+        grok.return_value = {"choices": [{"message": {"content": "Test reply"}}]}
+        await run_agent_turn("how much for white BOPP labels?", conversation_id="cid-1")
+        ret_pricing.assert_not_called()
+        last_user_msg = grok.call_args.args[0][-1]["content"]
+        self.assertIn("size and quantity", last_user_msg)
+        self.assertNotIn("STICKER_", last_user_msg)
+
 
 if __name__ == "__main__":
     unittest.main()

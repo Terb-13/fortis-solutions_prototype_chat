@@ -30,6 +30,7 @@ from fortis_cs_agent.estimate_detector import is_estimate_request
 from fortis_cs_agent import estimate_flow as _estimate_flow
 from fortis_cs_agent.estimate_sessions import EstimateSessionPersistenceError
 from fortis_cs_agent.knowledge import (
+    _extract_size_tuple,
     format_pricing_context,
     pricing_health_probe,
     retrieve_faq,
@@ -633,21 +634,21 @@ async def run_agent_turn(
         )
 
         pricing_results: list[dict[str, Any]] = []
-        if pricing_intent:
+        if pricing_intent and _extract_size_tuple(user_text.lower()):
             try:
-                pricing_results = retrieve_pricing(pricing_blob, limit=5)
+                pricing_results = retrieve_pricing(user_text, limit=5)
             except Exception:
                 logger.exception("retrieve_pricing failed; continuing without pricing rows.")
                 pricing_results = []
 
         # When label pricing rows exist, DO NOT mix in fortis_knowledge (training transcripts can mention pouches, etc.).
         if pricing_results:
-            knowledge_context = format_pricing_context(pricing_results, pricing_blob)
+            knowledge_context = format_pricing_context(pricing_results, user_text)
         elif pricing_intent:
             knowledge_context = (
-                "Quick Ship label pricing: No fortis_pricing rows matched this thread yet. "
-                "Stay on pressure-sensitive labels; do not cite pouch / flexible film examples. "
-                "Collect missing customer + address fields normally. Never invent dollars in prose."
+                "Do not quote a price. Ask the shopper for the size and quantity they need. "
+                "They can include contact details with that. "
+                "Stay on pressure-sensitive labels. Never invent dollars."
             )
         else:
             if _should_skip_knowledge_retrieval(user_text):

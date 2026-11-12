@@ -223,28 +223,6 @@ def retrieve_faq(query: str, limit: int = 5) -> List[Dict]:
     return [e["row"] for e in ranked[:limit]]
 
 
-# Pricing table text column (Postgres / Supabase schema uses comment_application).
-_FORTIS_PRICING_COMMENT_COL = "comment_application"
-
-
-def _pricing_dedupe_key(row: dict[str, Any]) -> tuple[Any, ...]:
-    """Stable tuple for deduping REST rows — handles missing UUID ``id`` or duplicate null ids."""
-    rid = row.get("id")
-    if rid is not None:
-        return ("id", rid)
-    sku = str(row.get("sku") or "").strip().lower()
-    if sku:
-        return ("sku", sku)
-    return (
-        "hash",
-        str(row.get("width_in")),
-        str(row.get("height_in")),
-        str(row.get("material") or "")[:80],
-        str(row.get(_FORTIS_PRICING_COMMENT_COL) or row.get("description") or "")[:120],
-        str(row.get("finish") or "")[:80],
-    )
-
-
 _MATERIAL_HINT_TERMS = frozenset(
     [
         "bopp",
@@ -279,25 +257,6 @@ def _user_mentioned_material(query_lower: str) -> bool:
     if re.search(r"\b\d+(?:\.\d+)?\s*mil\b", query_lower):
         return True
     return False
-
-
-def _material_match_score(query_lower: str, material: str) -> float:
-    """Rough overlap score for ranking catalog materials against user text."""
-    if not material:
-        return 0.0
-    mat_lower = material.lower()
-    score = 0.0
-    for term in _MATERIAL_HINT_TERMS:
-        if term in query_lower and term in mat_lower:
-            score += 2.0
-        elif term in query_lower:
-            pass
-    for token in re.findall(r"[a-z]{3,}", query_lower):
-        if len(token) > 12:
-            continue
-        if token in mat_lower:
-            score += 0.5
-    return score
 
 
 _ROW_SIZE_TOL_IN = 0.35
@@ -345,101 +304,15 @@ def _annotate_pricing_rows(
     return [{**dict(r), "_fortis_pricing_match": _match_tag(r)} for r in rows]
 
 
-def _execute_pricing_keyword_or(term: str, limit: int) -> Any:
-    """Run keyword OR against fortis_pricing with broadening filters if columns differ by env."""
-    c = _FORTIS_PRICING_COMMENT_COL
-    tbl = _fortis_pricing_table()
-    clauses = (
-        f"{c}.ilike.%{term}%,material.ilike.%{term}%,finish.ilike.%{term}%,notes.ilike.%{term}%",
-        f"{c}.ilike.%{term}%,material.ilike.%{term}%,finish.ilike.%{term}%",
-        f"{c}.ilike.%{term}%,material.ilike.%{term}%",
-        f"{c}.ilike.%{term}%",
-        f"material.ilike.%{term}%",
-    )
-    if not supabase:
-        return None
-    for filt in clauses:
-        try:
-            return supabase.table(tbl).select("*").or_(filt).limit(limit).execute()
-        except Exception:
-            logger.debug("pricing keyword clause failed tbl=%s filter=%r", tbl, filt[:120], exc_info=True)
-            continue
-    return None
-
-
-def _closest_pricing_fallback(query_lower: str, limit: int) -> list[dict[str, Any]]:
-    """When targeted paths yield nothing — load a slab of the pricing table and rank."""
-    if not supabase:
-        return []
-
-    tbl = _fortis_pricing_table()
-    mentioned_materials = sorted({m for m in _MATERIAL_HINT_TERMS if m in query_lower})
-    pool: list[dict[str, Any]] = []
-    seen: set[tuple[Any, ...]] = set()
-
-    def _add(rows: list[dict[str, Any]]) -> None:
-        for row in rows:
-            r = dict(row)
-            key = _pricing_dedupe_key(r)
-            if key in seen:
-                continue
-            seen.add(key)
-            pool.append(r)
-
-    try:
-        base = (
-            supabase.table(tbl).select("*").limit(max(400, limit * 80)).execute()
-        )
-        _add(list(base.data or []))
-        for material in mentioned_materials[:3]:
-            try:
-                res_mat = (
-                    supabase.table(tbl)
-                    .select("*")
-                    .ilike("material", f"%{material}%")
-                    .limit(120)
-                    .execute()
-                )
-                _add(list(res_mat.data or []))
-            except Exception:
-                logger.debug("fallback material subset failed material=%r", material, exc_info=True)
-    except Exception:
-        logger.warning("_closest_pricing_fallback fetch failed tbl=%s", tbl, exc_info=True)
-        return []
-
-    if not pool:
-        logger.warning(
-            "retrieve_pricing: table %s returned zero rows (empty table, wrong table name, or deny policy).",
-            tbl,
-        )
-        return []
-
-    ranked = sorted(
-        pool,
-        key=lambda r: -_material_match_score(query_lower, str(r.get("material") or "")),
-    )
-    return ranked[:limit]
-
-
 def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
-    """
-    Smart pricing retrieval from ``fortis_pricing``: SKU → material → size (+ nearest die) →
-    keywords → closest-match fallback over the catalog pool.
-
-    Each row may include ``_fortis_pricing_match``::
-
-        sku_exact | exact_size | closest_size | material_match | keyword_match |
-        closest_fallback | catalog_match
-    """
+    """Return an exact SKU or an exact size. No size means no rows."""
     if not supabase or not query:
         return []
 
     query_lower = query.lower()
     tbl = _fortis_pricing_table()
     tol = _ROW_SIZE_TOL_IN
-    mentioned_materials = sorted({m for m in _MATERIAL_HINT_TERMS if m in query_lower})
 
-    # --- 1) SKU ---
     sku_match = re.search(r"(sticker_[a-z0-9.]+)", query_lower)
     if sku_match:
         sku = sku_match.group(1).upper()
@@ -450,97 +323,21 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
         except Exception:
             logger.warning("retrieve_pricing SKU lookup failed sku=%r", sku, exc_info=True)
 
-    # Exact size before material so 2x3 white BOPP is not the first BOPP SKU.
     size_tuple = _extract_size_tuple(query_lower)
-    if size_tuple:
-        tw, th, exact_tol = *size_tuple, 0.02
-        window = (
-            f"and(width_in.gte.{tw - exact_tol:.4f},width_in.lte.{tw + exact_tol:.4f},height_in.gte.{th - exact_tol:.4f},height_in.lte.{th + exact_tol:.4f}),"
-            f"and(width_in.gte.{th - exact_tol:.4f},width_in.lte.{th + exact_tol:.4f},height_in.gte.{tw - exact_tol:.4f},height_in.lte.{tw + exact_tol:.4f})"
-        )
-        try:
-            res = supabase.table(tbl).select("*").or_(window).limit(max(limit * 4, 12)).execute()
-            exact = [dict(r) for r in (res.data or [])]
-            if exact:
-                return _annotate_pricing_rows(exact[:limit], query_lower, how="size", tol=tol)
-        except Exception:
-            logger.warning("retrieve_pricing exact-size query failed", exc_info=True)
-        return []
-
-    # --- 2) Material (skipped when a size was requested) ---
-    results: list[dict[str, Any]] = []
-    seen_mat: set[tuple[Any, ...]] = set()
-
-    def _take_material_row(row_raw: dict[str, Any]) -> bool:
-        row = dict(row_raw)
-        dk = _pricing_dedupe_key(row)
-        if dk in seen_mat:
-            return len(results) >= limit
-        seen_mat.add(dk)
-        results.append(row)
-        return len(results) >= limit
-
     if not size_tuple:
-        for material in mentioned_materials[:3]:
-            try:
-                res = (
-                    supabase.table(tbl)
-                    .select("*")
-                    .ilike("material", f"%{material}%")
-                    .limit(max(limit * 2, 8))
-                    .execute()
-                )
-            except Exception:
-                logger.warning("retrieve_pricing material filter failed material=%r", material, exc_info=True)
-                continue
-            scored = sorted(
-                res.data or [],
-                key=lambda r: (-_material_match_score(query_lower, str(r.get("material") or "")), str(r.get("sku"))),
-            )
-            for row in scored:
-                if _take_material_row(row):
-                    return _annotate_pricing_rows(results[:limit], query_lower, how="material", tol=tol)
-
-        if results:
-            return _annotate_pricing_rows(results[:limit], query_lower, how="material", tol=tol)
-
-    # --- 4) Keywords OR ---
-    results = []
-    seen_kw: set[tuple[Any, ...]] = set()
-    keywords = [k for k in query_lower.split() if len(k) > 2]
-    for keyword in keywords[:6]:
-        term = _safe_ilike_term(keyword)
-        if not term:
-            continue
-        res_kw = _execute_pricing_keyword_or(term, limit)
-        if res_kw is None:
-            logger.warning(
-                "retrieve_pricing keyword OR exhausted all clauses term=%r table=%s", term, tbl
-            )
-            continue
-        for row in res_kw.data or []:
-            r = dict(row)
-            dk = _pricing_dedupe_key(r)
-            if dk in seen_kw:
-                continue
-            seen_kw.add(dk)
-            results.append(r)
-            if len(results) >= limit:
-                return _annotate_pricing_rows(results[:limit], query_lower, how="keyword", tol=tol)
-
-    if results:
-        return _annotate_pricing_rows(results[:limit], query_lower, how="keyword", tol=tol)
-
-    # --- 5) Whole-catalog closest match ---
-    fb = _closest_pricing_fallback(query_lower, limit)
-    if fb:
-        return _annotate_pricing_rows(fb, query_lower, how="fallback", tol=tol)
-
-    logger.warning(
-        "retrieve_pricing returned no rows (table=%r query_prefix=%r). Check GET /health field pricing_health.",
-        tbl,
-        query.strip()[:120],
+        return []
+    tw, th, exact_tol = *size_tuple, 0.02
+    window = (
+        f"and(width_in.gte.{tw - exact_tol:.4f},width_in.lte.{tw + exact_tol:.4f},height_in.gte.{th - exact_tol:.4f},height_in.lte.{th + exact_tol:.4f}),"
+        f"and(width_in.gte.{th - exact_tol:.4f},width_in.lte.{th + exact_tol:.4f},height_in.gte.{tw - exact_tol:.4f},height_in.lte.{tw + exact_tol:.4f})"
     )
+    try:
+        res = supabase.table(tbl).select("*").or_(window).limit(max(limit * 4, 12)).execute()
+        exact = [dict(r) for r in (res.data or [])]
+        if exact:
+            return _annotate_pricing_rows(exact[:limit], query_lower, how="size", tol=tol)
+    except Exception:
+        logger.warning("retrieve_pricing exact-size query failed", exc_info=True)
     return []
 
 
