@@ -69,6 +69,39 @@ class TestBadEstimateRegressions(unittest.TestCase):
             self.assertEqual(item["description"], "2 × 3 in · White BOPP, gloss · CMYK")
 
 
+class TestMidQuoteSizeChange(unittest.TestCase):
+    @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
+    @patch("fortis_cs_agent.estimate_flow.retrieve_pricing")
+    @patch("fortis_cs_agent.estimate_flow.execute_agent_tool")
+    def test_new_size_at_name_step_reprices(self, tool, pricing, _fetch):
+        row = {
+            "sku": "STICKER_3x4_WBGP_G",
+            "width_in": 3,
+            "height_in": 4,
+            "material": "2.6mil White BOPP / GPX / 40# SCK",
+            "finish": "Gloss",
+            "cost_5000": "120.00",
+        }
+        pricing.return_value = [row]
+        saved = {}
+        tool.side_effect = lambda _n, args, **_k: saved.update(item=args["items"][0]) or {"estimate_id": "00000000-0000-4000-8000-000000000099"}
+        draft = {"product_details": "5000 2x3 white bopp gloss cmyk", "_quantity_hint": 5000}
+        changed = _turn(1, draft, "and for 3x4 labels?")
+        self.assertNotIn("label spec", changed.reply)
+        self.assertNotIn("Step 2/5 (again)", changed.reply)
+        spec = changed.assistant_meta["estimate_flow"]["draft"]["product_details"]
+        self.assertIn("3x4", spec)
+        self.assertNotIn("2x3", spec)
+        history = [{"role": "assistant", "content": changed.reply, "meta": changed.assistant_meta}]
+        result = changed
+        for message in ("Acme Packaging", "Sam Jones", "a@b.co", "skip"):
+            result = handle_estimate_flow(user_message=message, conversation_history=history, conversation_id=_CID)
+            history += [{"role": "user", "content": message}, {"role": "assistant", "content": result.reply, "meta": result.assistant_meta or {}}]
+        self.assertEqual(saved["item"]["sku"], "STICKER_3x4_WBGP_G")
+        self.assertEqual(saved["item"]["total"], 120.0)
+        self.assertTrue(any("3x4" in str(call.args[0]) for call in pricing.call_args_list))
+
+
 class TestSecondQuantityMiss(unittest.TestCase):
     @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
     def test_second_miss_does_not_repeat_step1(self, _fetch):
