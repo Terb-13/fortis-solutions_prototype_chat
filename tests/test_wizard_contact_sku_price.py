@@ -100,7 +100,7 @@ class TestMidQuoteSizeChange(unittest.TestCase):
         spec = result.assistant_meta["estimate_flow"]["draft"]
         self.assertIn("3x2", spec["product_details"])
         self.assertNotIn("2x3", spec["product_details"])
-        self.assertEqual(spec["_quantity_hint"], 2000)
+        self.assertIn("2000", spec["product_details"])
         history = [{"role": "assistant", "content": result.reply, "meta": result.assistant_meta}]
         for message in ("Acme Packaging", "Sam Jones", "a@b.co", "skip"):
             result = handle_estimate_flow(user_message=message, conversation_history=history, conversation_id=_CID)
@@ -175,6 +175,14 @@ class TestMidQuoteSizeChange(unittest.TestCase):
         self.assertIn("Step 5/5", result.reply)
         self.assertNotIn("Your quote is ready", result.reply)
         self.assertIn("3x4", result.assistant_meta["estimate_flow"]["draft"]["product_details"])
+
+    @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
+    def test_by_size_does_not_set_quantity(self, _fetch):
+        draft = {"product_details": "2x3 white bopp gloss cmyk"}
+        result = _turn(0, draft, "3 by 4")
+        spec = result.assistant_meta["estimate_flow"]["draft"]
+        self.assertIsNone(spec.get("_quantity_hint"))
+        self.assertIn("**quantity**", result.reply)
 
     @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
     def test_third_quantity_miss(self, _fetch):

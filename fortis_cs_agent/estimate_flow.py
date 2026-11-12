@@ -1046,28 +1046,22 @@ def handle_estimate_flow(
     new_size = _extract_size_tuple(answer.lower())
     old_size = _extract_size_tuple(str(draft.get("product_details") or "").lower())
     if new_size and old_size and (abs(new_size[0] - old_size[0]) > 0.02 or abs(new_size[1] - old_size[1]) > 0.02):
-        for key in ("sku", "price", "unit_price", "total"):
+        for key in ("sku", "price", "unit_price", "total", "_quantity_hint"):
             draft.pop(key, None)
-        draft["product_details"] = re.sub(
+        swapped = re.sub(
             r"(\d+(?:\.\d+)?)\s*(?:x|×|\bby\b)\s*(\d+(?:\.\d+)?)",
             f"{new_size[0]:g}x{new_size[1]:g}",
             str(draft["product_details"]),
             count=1,
             flags=re.IGNORECASE,
         )
-        q = _extract_quantity(answer.lower())
-        if q:
-            draft["_quantity_hint"] = q
+        draft["product_details"] = _merge_step1_blob(swapped, answer)
+        low = str(draft["product_details"]).lower()
         fp = _first_pending_step_index(draft)
         if fp == 0:
-            return _step1_miss_result(
-                draft, ", ".join(_step1_missing_parts(str(draft["product_details"]).lower())), conversation_history, conversation_id
-            )
+            return _step1_miss_result(draft, ", ".join(_step1_missing_parts(low)), conversation_history, conversation_id)
         return EstimateFlowResult(
-            handled=True,
-            reply=_prompt_for_pending_index(fp),
-            assistant_meta=_meta_payload(draft, fp),
-            estimate_id=None,
+            handled=True, reply=_prompt_for_pending_index(fp), assistant_meta=_meta_payload(draft, fp), estimate_id=None
         )
 
     if step_key == "product_details":
