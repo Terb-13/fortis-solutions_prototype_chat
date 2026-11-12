@@ -236,84 +236,6 @@ def _draft_to_stored_collected(draft: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _sizes_differ(old: tuple[float, float], new: tuple[float, float]) -> bool:
-    def _near(a: tuple[float, float], b: tuple[float, float]) -> bool:
-        return abs(a[0] - b[0]) <= 0.02 and abs(a[1] - b[1]) <= 0.02
-
-    return not (_near(old, new) or _near(old, (new[1], new[0])))
-
-
-def _retarget_spec(draft: dict[str, Any], size: tuple[float, float]) -> None:
-    """Replace the saved size. Keep quantity and material only when the exact row still supports them."""
-    for key in ("sku", "price", "unit_price", "total"):
-        draft.pop(key, None)
-    blob = str(draft.get("product_details") or "")
-    low = blob.lower()
-    rows = retrieve_pricing(f"{size[0]:g}x{size[1]:g}", limit=1)
-    row = rows[0] if rows else None
-    qty = draft.get("_quantity_hint") if isinstance(draft.get("_quantity_hint"), int) else _extract_quantity(low)
-    keep_qty = False
-    if isinstance(qty, int) and row is not None:
-        ck = _qty_to_cost_key(qty)
-        keep_qty = bool(ck and row.get(ck) is not None)
-    mat_m = _STEP1_MATERIAL_RE.search(low)
-    keep_mat = bool(mat_m and mat_m.group(0).lower() in str((row or {}).get("material") or "").lower())
-    fin_m = _STEP1_FINISH_RE.search(low)
-    col_m = _STEP1_COLORS_RE.search(low)
-    parts: list[str] = []
-    if keep_qty and isinstance(qty, int):
-        parts.append(f"{qty} labels")
-        draft["_quantity_hint"] = qty
-    else:
-        draft.pop("_quantity_hint", None)
-    parts.append(f"{size[0]:g}x{size[1]:g}")
-    if keep_mat and mat_m:
-        parts.append(mat_m.group(0))
-    if fin_m:
-        parts.append(fin_m.group(0))
-    if col_m:
-        parts.append(col_m.group(0))
-    draft["product_details"] = " ".join(parts)
-
-
-def _fold_same_size(draft: dict[str, Any], answer: str) -> None:
-    """Keep the saved spec. A same-size restatement must not replace it."""
-    blob = str(draft.get("product_details") or "")
-    extra: list[str] = []
-    answer_low = answer.lower()
-    blob_low = blob.lower()
-    qty = _extract_quantity(answer_low)
-    if qty and _extract_quantity(blob_low) is None and not isinstance(draft.get("_quantity_hint"), int):
-        extra.append(f"{qty} labels")
-        draft["_quantity_hint"] = qty
-    for rx in (_STEP1_MATERIAL_RE, _STEP1_FINISH_RE, _STEP1_COLORS_RE):
-        found = rx.search(answer_low)
-        if found and not rx.search(blob_low):
-            extra.append(found.group(0))
-    if extra:
-        draft["product_details"] = f"{blob}; {'; '.join(extra)}"
-
-
-def _reply_for_current_spec(draft: dict[str, Any], history: list[dict[str, Any]]) -> EstimateFlowResult:
-    low = str(draft.get("product_details") or "").lower()
-    if not _step1_specs_complete(low):
-        miss_txt = ", ".join(_step1_missing_parts(low))
-        reply = _step1_continue_reply(miss_txt, history)
-        if reply is None:
-            return EstimateFlowResult(handled=False)
-        return EstimateFlowResult(
-            handled=True,
-            reply=reply,
-            assistant_meta=_meta_payload(draft, 0),
-        )
-    nxt = _first_pending_step_index(draft)
-    return EstimateFlowResult(
-        handled=True,
-        reply=_prompt_for_pending_index(nxt),
-        assistant_meta=_meta_payload(draft, nxt),
-    )
-
-
 def _merge_step1_blob(prior: str, answer: str) -> str:
     p, a = prior.strip(), answer.strip()
     if not p:
@@ -712,34 +634,24 @@ def latest_estimate_flow_snapshot(history_rows: list[dict[str, Any]]) -> tuple[d
 
 
 def _step1_continue_reply(miss_txt: str, history: list[dict[str, Any]] | None = None) -> str | None:
-    """Step 1 partial progress. Quantity is asked at most once in each wording."""
+    """Step 1 partial progress. Each quantity wording is sent at most once."""
     reply = (
         f"**Step 1/5:** Thanks — I still need: {miss_txt}.\n\n"
         "Send what’s missing in one line (or another short line if that’s easier—I’ll combine them)."
     )
     if "**quantity**" not in miss_txt:
         return reply
-    seen: set[str] = set()
+    n = 0
     for row in history or []:
         if row.get("role") == "user" and _extract_quantity((row.get("content") or "").lower()):
-            seen.clear()
+            n = 0
             continue
         if row.get("role") != "assistant":
             continue
         text = (row.get("content") or "").strip()
-        if text == _QTY_LATER:
-            seen.add("later")
-        elif text == _QTY_THOUSAND:
-            seen.add("thousand")
-        elif "**quantity**" in text and "still need" in text.lower():
-            seen.add("step")
-    if "later" in seen:
-        return None
-    if "thousand" in seen:
-        return _QTY_LATER
-    if "step" in seen:
-        return _QTY_THOUSAND
-    return reply
+        if text in (_QTY_THOUSAND, _QTY_LATER) or ("**quantity**" in text and "still need" in text.lower()):
+            n += 1
+    return [reply, _QTY_THOUSAND, _QTY_LATER][n] if n < 3 else None
 
 
 def _resolve_wizard_snap(
@@ -806,18 +718,11 @@ _QTY_LATER = "No problem. Whenever you have a number, send it here and I'll pric
 _CUSTOM_QUOTE_REPLY = "Sure. Send the size, quantity, material and finish you need."
 
 
-def _step1_miss_result(
-    draft: dict[str, Any], miss_txt: str, history: list[dict[str, Any]]
-) -> EstimateFlowResult:
+def _step1_miss_result(draft: dict[str, Any], miss_txt: str, history: list[dict[str, Any]]) -> EstimateFlowResult:
     reply = _step1_continue_reply(miss_txt, history)
     if reply is None:
         return EstimateFlowResult(handled=False)
-    return EstimateFlowResult(
-        handled=True,
-        reply=reply,
-        assistant_meta=_meta_payload(draft, 0),
-        estimate_id=None,
-    )
+    return EstimateFlowResult(handled=True, reply=reply, assistant_meta=_meta_payload(draft, 0), estimate_id=None)
 
 
 def _persist_structured_estimate(
@@ -979,8 +884,6 @@ def handle_estimate_flow(
     raw = _normalize_user_line_for_wizard(shopper_utterance_for_estimate_heuristics(user_message))
     if not raw:
         return EstimateFlowResult(handled=False)
-    if re.search(r"\bcustom\s+quote\b", raw, re.IGNORECASE):
-        return EstimateFlowResult(handled=True, reply=_CUSTOM_QUOTE_REPLY)
 
     session_row = fetch_estimate_session(conversation_id)
     if session_row and session_row.get("status") == "in_progress":
@@ -997,6 +900,8 @@ def handle_estimate_flow(
 
     snap = _resolve_wizard_snap(conversation_id, conversation_history, session_row)
     carrying = snap is not None
+    if not carrying and re.search(r"\bcustom\s+quote\b", raw, re.IGNORECASE):
+        return EstimateFlowResult(handled=True, reply=_CUSTOM_QUOTE_REPLY)
 
     # Hard guard: never open the wizard on capability / refusal / SBU / general-topic openers.
     if not carrying and should_skip_estimate_wizard_opener(raw):
@@ -1126,24 +1031,25 @@ def handle_estimate_flow(
         )
 
     answer = raw.strip()
+    new_size = _extract_size_tuple(answer.lower())
+    old_size = _extract_size_tuple(str(draft.get("product_details") or "").lower())
+    if new_size and old_size and (abs(new_size[0] - old_size[0]) > 0.02 or abs(new_size[1] - old_size[1]) > 0.02):
+        for key in ("sku", "price", "unit_price", "total"):
+            draft.pop(key, None)
+        draft["product_details"] = re.sub(
+            r"(\d+(?:\.\d+)?)\s*(?:x|×|\bby\b)\s*(\d+(?:\.\d+)?)",
+            f"{new_size[0]:g}x{new_size[1]:g}",
+            str(draft["product_details"]),
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        fp = _first_pending_step_index(draft)
+        if fp == 0:
+            return _step1_miss_result(draft, ", ".join(_step1_missing_parts(str(draft["product_details"]).lower())), conversation_history)
+        return EstimateFlowResult(handled=True, reply=_prompt_for_pending_index(fp), assistant_meta=_meta_payload(draft, fp), estimate_id=None)
 
     if step_key == "product_details":
-        prior = str(draft.get("product_details") or "").strip()
-        new_size = _extract_size_tuple(answer.lower())
-        old_size = _extract_size_tuple(prior.lower()) if prior else None
-        if new_size and old_size and _sizes_differ(old_size, new_size):
-            _retarget_spec(draft, new_size)
-            return _reply_for_current_spec(draft, conversation_history)
-        if new_size and old_size and not _sizes_differ(old_size, new_size):
-            _fold_same_size(draft, answer)
-            low = str(draft.get("product_details") or "").lower()
-            qty_known = isinstance(draft.get("_quantity_hint"), int) or _extract_quantity(low) is not None
-            if not qty_known:
-                return _step1_miss_result(draft, "**quantity**", conversation_history)
-            if not _step1_specs_complete(low):
-                miss_txt = ", ".join(_step1_missing_parts(low))
-                return _step1_miss_result(draft, miss_txt, conversation_history)
-        elif _looks_like_labeled_estimate_form(raw):
+        if _looks_like_labeled_estimate_form(raw):
             patches = _parse_labeled_estimate_to_draft(raw)
             merged_pd = str(draft.get("product_details") or "").strip()
             for k, v in patches.items():
@@ -1183,12 +1089,6 @@ def handle_estimate_flow(
                 miss_txt = ", ".join(_step1_missing_parts(low))
                 return _step1_miss_result(draft, miss_txt, conversation_history)
     elif step_key == "business_name":
-        new_size = _extract_size_tuple(answer.lower())
-        old_size = _extract_size_tuple(str(draft.get("product_details") or "").lower())
-        if new_size and old_size:
-            if _sizes_differ(old_size, new_size):
-                _retarget_spec(draft, new_size)
-            return _reply_for_current_spec(draft, conversation_history)
         issue = _business_name_field_issue(answer)
         if issue:
             sn = _safe_ack_snippet(answer)
@@ -1199,12 +1099,6 @@ def handle_estimate_flow(
             )
         draft["business_name"] = answer
     elif step_key == "contact_name":
-        new_size = _extract_size_tuple(answer.lower())
-        old_size = _extract_size_tuple(str(draft.get("product_details") or "").lower())
-        if new_size and old_size:
-            if _sizes_differ(old_size, new_size):
-                _retarget_spec(draft, new_size)
-            return _reply_for_current_spec(draft, conversation_history)
         issue = _contact_name_field_issue(answer)
         if issue:
             sn = _safe_ack_snippet(answer)
