@@ -403,16 +403,6 @@ def _mentioned_qty_tiers(query_lower: str) -> list[int]:
     return found
 
 
-def _exact_row_for_size(
-    rows: list[dict[str, Any]],
-    tw: float,
-    th: float,
-    *,
-    tol: float = _ROW_SIZE_TOL_IN,
-) -> bool:
-    return any(_row_matches_size_tolerance(r, tw, th, tol) for r in rows)
-
-
 def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
     """
     Build compact pricing context with guided next-step hints for the model.
@@ -472,11 +462,6 @@ def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
     )
 
     parts = [header, "\n".join(lines)]
-
-    if size_tuple:
-        tw, th = size_tuple
-        if _exact_row_for_size(rows, tw, th):
-            parts.append(f"Catalog truth: An exact {tw}×{th} in. row exists in the snapshot below.")
 
     if rows and any(
         "bopp" in str(r.get("material") or "").lower()
@@ -557,8 +542,8 @@ def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
     elif wants_more_opts:
         parts.append(
             "Options step: User asked for more options — reply ONLY with separate rows from the list above "
-            "(different material/finish/SKU lines). If only one row exists, say so honestly and describe trade-offs briefly "
-            "without inventing SKUs or pouch pricing."
+            "(different material or finish). If only one row exists, say so honestly and describe trade-offs briefly "
+            "without inventing prices or pouch pricing. Do not show SKU codes."
         )
     else:
         parts.append(
@@ -572,7 +557,7 @@ def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
         parts.append(
             "Quote completion: When required customer fields + SKU detail are settled, assistants emit STRICT JSON payloads "
             "for the backend (see system prompt). Map totals/unit_price ONLY from Cost@ tiers listed above—never hallucinate SKU "
-            "dollar amounts in conversational prose beforehand."
+            "dollar amounts in conversational prose beforehand. Do not show SKU codes in conversational replies."
         )
     parts.append(
         "PDF alternate only: Reserve generate_estimate_pdf for explicit downloadable PDF tooling outside structured JSON quotes."
