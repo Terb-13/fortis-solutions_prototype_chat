@@ -1055,7 +1055,10 @@ def handle_estimate_flow(
             count=1,
             flags=re.IGNORECASE,
         )
-        draft["product_details"] = _merge_step1_blob(swapped, answer)
+        rest = re.sub(
+            r"(\d+(?:\.\d+)?)\s*(?:x|×|\bby\b)\s*(\d+(?:\.\d+)?)", "", answer, count=1, flags=re.IGNORECASE
+        ).strip(" ,;")
+        draft["product_details"] = _merge_step1_blob(rest, swapped) if rest else swapped
         low = str(draft["product_details"]).lower()
         fp = _first_pending_step_index(draft)
         if fp == 0:

@@ -10,7 +10,7 @@ from fortis_cs_agent.estimate_flow import (
     handle_estimate_flow,
     sync_wizard_session_from_result,
 )
-from fortis_cs_agent.knowledge import retrieve_pricing
+from fortis_cs_agent.knowledge import _extract_quantity, retrieve_pricing
 
 _CID = "00000000-0000-4000-8000-000000000581"
 _NOTE = "roll labels, 3 inch core, no other requirements"
@@ -107,6 +107,14 @@ class TestMidQuoteSizeChange(unittest.TestCase):
             history += [{"role": "user", "content": message}, {"role": "assistant", "content": result.reply, "meta": result.assistant_meta or {}}]
         self.assertEqual(saved["item"]["quantity"], 2000)
         self.assertNotEqual(saved["item"]["total"], 83.9)
+
+    @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
+    def test_by_size_keeps_old_quantity(self, _fetch):
+        draft = {"product_details": "5000 2x3 white bopp gloss cmyk", "_quantity_hint": 5000}
+        result = _turn(1, draft, "actually 12 by 18")
+        blob = result.assistant_meta["estimate_flow"]["draft"]["product_details"].lower()
+        self.assertEqual(_extract_quantity(blob), 5000)
+        self.assertIn("12x18", blob)
 
     @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
     def test_quantity_nags_reset_after_cancel(self, _fetch):
