@@ -293,13 +293,11 @@ def _annotate_pricing_rows(
                 return "material_match"
             if how == "keyword":
                 return "keyword_match"
-            if how == "fallback":
-                return "closest_fallback"
             return "catalog_match"
 
         if exact:
             return "exact_size"
-        return "closest_fallback" if how == "fallback" else "closest_size"
+        return "catalog_match"
 
     return [{**dict(r), "_fortis_pricing_match": _match_tag(r)} for r in rows]
 
@@ -444,9 +442,6 @@ def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
 
     tier_qtys = _mentioned_qty_tiers(query_lower)
 
-    match_hints = [str(row.get("_fortis_pricing_match") or "") for row in rows[:5]]
-    is_closest_catalog = any(h in ("closest_size", "closest_fallback") for h in match_hints)
-
     lines: list[str] = []
     for row in rows[:5]:
         sku = row.get("sku") or "Unknown SKU"
@@ -455,15 +450,9 @@ def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
         finish = row.get("finish") or "N/A"
         selected_cost = row.get(qty_key)
         cost_label = qty_key.replace("cost_", "").upper()
-        tag = row.get("_fortis_pricing_match")
-        tag_note = (
-            f" | (nearest catalog match: {tag})"
-            if tag in ("closest_size", "closest_fallback")
-            else ""
-        )
         lines.append(
             f"- {sku} | {description} | Material: {material} | Finish: {finish} | "
-            f"Cost@{cost_label}: {selected_cost}{tag_note}"
+            f"Cost@{cost_label}: {selected_cost}"
         )
 
     distinct_materials: list[str] = []
@@ -480,11 +469,6 @@ def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
     header = (
         "Pricing Agent Context (Quick Ship labels / fortis_pricing ONLY — not pouches, shipper boxes, or unrelated packaging):"
     )
-    if is_closest_catalog:
-        header += (
-            "\nNearest-match note: No exact SKU/product match was found for the request as stated. Recommend the closest "
-            "rows below explicitly; confirm material, finish, and dimensions with the customer before locking a quote."
-        )
 
     parts = [header, "\n".join(lines)]
 
@@ -492,20 +476,6 @@ def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
         tw, th = size_tuple
         if _exact_row_for_size(rows, tw, th):
             parts.append(f"Catalog truth: An exact {tw}×{th} in. row exists in the snapshot below.")
-        else:
-            closest = rows[0]
-            cw = closest.get("width_in")
-            ch = closest.get("height_in")
-            cmat = closest.get("material") or "N/A"
-            cfinish = closest.get("finish") or "N/A"
-            parts.append(
-                f"Catalog truth: No exact {tw}×{th} in. row in this pricing snapshot — closest row shown is "
-                f"{cw}×{ch} in. Say that clearly; do not imply an exact {tw}×{th} die exists unless it appears above."
-            )
-            parts.append(
-                f"Closest-size recommendation: Direct the customer to {cw}×{ch} in. as the nearest available option "
-                f"(material: {cmat}; finish: {cfinish}). Ask if they want to proceed with this nearest size or request custom tooling."
-            )
 
     if rows and any(
         "bopp" in str(r.get("material") or "").lower()
