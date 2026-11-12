@@ -633,12 +633,25 @@ def latest_estimate_flow_snapshot(history_rows: list[dict[str, Any]]) -> tuple[d
     return _infer_snapshot_from_assistant_content(history_rows)
 
 
-def _step1_continue_reply(miss_txt: str) -> str:
-    """Step 1 partial progress without echoing the user’s prior line back to them."""
-    return (
+def _step1_continue_reply(miss_txt: str, history: list[dict[str, Any]] | None = None) -> str:
+    """Step 1 partial progress. A second identical quantity ask uses the fallback."""
+    reply = (
         f"**Step 1/5:** Thanks — I still need: {miss_txt}.\n\n"
         "Send what’s missing in one line (or another short line if that’s easier—I’ll combine them)."
     )
+    if "**quantity**" not in miss_txt:
+        return reply
+    last = ""
+    for row in reversed(history or []):
+        if row.get("role") == "assistant":
+            last = (row.get("content") or "").strip()
+            break
+    if last == reply.strip():
+        return (
+            "No problem. Most orders start at 1,000 labels. "
+            "Send a number to price it, or ask for a custom quote and include your contact details."
+        )
+    return reply
 
 
 def _resolve_wizard_snap(
@@ -681,7 +694,7 @@ def _prompt_for_pending_index(idx: int) -> str:
     step = _STEPS[idx]
     if step == "product_details":
         return (
-            "Got it — I’ll collect a structured Quick Ship estimate.\n\n"
+            "Got it — I’ll collect a quote.\n\n"
             "**Step 1/5:** In one line send **quantity**, **size (W×H in.)**, **material**, "
             "**finish**, and **print colors**."
         )
@@ -924,7 +937,7 @@ def handle_estimate_flow(
                     miss_txt = ", ".join(_step1_missing_parts(blob_low))
                     return EstimateFlowResult(
                         handled=True,
-                        reply=_step1_continue_reply(miss_txt),
+                        reply=_step1_continue_reply(miss_txt, conversation_history),
                         assistant_meta=_meta_payload(dict(labeled_draft), 0),
                         estimate_id=None,
                     )
@@ -953,7 +966,7 @@ def handle_estimate_flow(
             miss_txt = ", ".join(_step1_missing_parts(msg_lower))
             return EstimateFlowResult(
                 handled=True,
-                reply=_step1_continue_reply(miss_txt),
+                reply=_step1_continue_reply(miss_txt, conversation_history),
                 assistant_meta=_meta_payload(draft, pending_step_index=0),
                 estimate_id=None,
             )
@@ -969,7 +982,7 @@ def handle_estimate_flow(
                 miss_txt = ", ".join(_step1_missing_parts(msg_lower))
                 return EstimateFlowResult(
                     handled=True,
-                    reply=_step1_continue_reply(miss_txt),
+                    reply=_step1_continue_reply(miss_txt, conversation_history),
                     assistant_meta=_meta_payload(draft, pending_step_index=0),
                     estimate_id=None,
                 )
@@ -1044,7 +1057,7 @@ def handle_estimate_flow(
                 miss_txt = ", ".join(_step1_missing_parts(low))
                 return EstimateFlowResult(
                     handled=True,
-                    reply=_step1_continue_reply(miss_txt),
+                    reply=_step1_continue_reply(miss_txt, conversation_history),
                     assistant_meta=_meta_payload(draft, pending_step_index=0),
                     estimate_id=None,
                 )
@@ -1068,7 +1081,7 @@ def handle_estimate_flow(
                 miss_txt = ", ".join(_step1_missing_parts(low))
                 return EstimateFlowResult(
                     handled=True,
-                    reply=_step1_continue_reply(miss_txt),
+                    reply=_step1_continue_reply(miss_txt, conversation_history),
                     assistant_meta=_meta_payload(draft, pending_step_index=0),
                     estimate_id=None,
                 )
