@@ -649,6 +649,10 @@ def _step1_continue_reply(miss_txt: str, history: list[dict[str, Any]] | None = 
         if row.get("role") != "assistant":
             continue
         text = (row.get("content") or "").strip()
+        flow = _coerce_meta_outer(row.get("meta")).get("estimate_flow")
+        if (isinstance(flow, dict) and flow.get("active") is False) or "collect a quote" in text:
+            n = 0
+            continue
         if text in (_QTY_THOUSAND, _QTY_LATER) or ("**quantity**" in text and "still need" in text.lower()):
             n += 1
     return [reply, _QTY_THOUSAND, _QTY_LATER][n] if n < 3 else None
@@ -718,9 +722,17 @@ _QTY_LATER = "No problem. Whenever you have a number, send it here and I'll pric
 _CUSTOM_QUOTE_REPLY = "Sure. Send the size, quantity, material and finish you need."
 
 
-def _step1_miss_result(draft: dict[str, Any], miss_txt: str, history: list[dict[str, Any]]) -> EstimateFlowResult:
+def _step1_miss_result(
+    draft: dict[str, Any], miss_txt: str, history: list[dict[str, Any]], conversation_id: str
+) -> EstimateFlowResult:
     reply = _step1_continue_reply(miss_txt, history)
     if reply is None:
+        upsert_estimate_session(
+            conversation_id,
+            current_step=1,
+            collected_data=_draft_to_stored_collected(draft),
+            status="in_progress",
+        )
         return EstimateFlowResult(handled=False)
     return EstimateFlowResult(handled=True, reply=reply, assistant_meta=_meta_payload(draft, 0), estimate_id=None)
 
@@ -947,7 +959,7 @@ def handle_estimate_flow(
                 blob_low = str(labeled_draft.get("product_details") or "").lower()
                 if pi == 0 and not _step1_specs_complete(blob_low):
                     miss_txt = ", ".join(_step1_missing_parts(blob_low))
-                    return _step1_miss_result(dict(labeled_draft), miss_txt, conversation_history)
+                    return _step1_miss_result(dict(labeled_draft), miss_txt, conversation_history, conversation_id)
                 return EstimateFlowResult(
                     handled=True,
                     reply=_prompt_for_pending_index(pi),
@@ -971,7 +983,7 @@ def handle_estimate_flow(
                     estimate_id=None,
                 )
             miss_txt = ", ".join(_step1_missing_parts(msg_lower))
-            return _step1_miss_result(draft, miss_txt, conversation_history)
+            return _step1_miss_result(draft, miss_txt, conversation_history, conversation_id)
 
         if not rich:
             if should_skip_estimate_wizard_opener(raw):
@@ -982,7 +994,7 @@ def handle_estimate_flow(
                 if qh:
                     draft["_quantity_hint"] = qh
                 miss_txt = ", ".join(_step1_missing_parts(msg_lower))
-                return _step1_miss_result(draft, miss_txt, conversation_history)
+                return _step1_miss_result(draft, miss_txt, conversation_history, conversation_id)
             if not _EXPLICIT_QUOTE_COLD_OPENER_RE.search(msg_lower):
                 return EstimateFlowResult(handled=False)
 
@@ -1043,10 +1055,6 @@ def handle_estimate_flow(
             count=1,
             flags=re.IGNORECASE,
         )
-        fp = _first_pending_step_index(draft)
-        if fp == 0:
-            return _step1_miss_result(draft, ", ".join(_step1_missing_parts(str(draft["product_details"]).lower())), conversation_history)
-        return EstimateFlowResult(handled=True, reply=_prompt_for_pending_index(fp), assistant_meta=_meta_payload(draft, fp), estimate_id=None)
 
     if step_key == "product_details":
         if _looks_like_labeled_estimate_form(raw):
@@ -1068,7 +1076,7 @@ def handle_estimate_flow(
             fp2 = _first_pending_step_index(draft)
             if fp2 == 0 and not _step1_specs_complete(low):
                 miss_txt = ", ".join(_step1_missing_parts(low))
-                return _step1_miss_result(draft, miss_txt, conversation_history)
+                return _step1_miss_result(draft, miss_txt, conversation_history, conversation_id)
             if fp2 > 0:
                 return EstimateFlowResult(
                     handled=True,
@@ -1087,7 +1095,7 @@ def handle_estimate_flow(
                 draft["_quantity_hint"] = q
             if not _step1_specs_complete(low):
                 miss_txt = ", ".join(_step1_missing_parts(low))
-                return _step1_miss_result(draft, miss_txt, conversation_history)
+                return _step1_miss_result(draft, miss_txt, conversation_history, conversation_id)
     elif step_key == "business_name":
         issue = _business_name_field_issue(answer)
         if issue:

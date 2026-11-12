@@ -80,16 +80,47 @@ def _quantity_misses(n: int):
 
 class TestMidQuoteSizeChange(unittest.TestCase):
     @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
-    def test_new_size_at_name_step(self, _fetch):
-        draft = {"product_details": "5000 2x3 white bopp gloss cmyk", "_quantity_hint": 5000, "sku": "STICKER_2x3_WBGP_G", "price": 1, "unit_price": 1, "total": 1}
-        result = _turn(1, draft, "and for 3x4 labels?")
+    def test_size_change_keeps_the_rest_of_the_message(self, _fetch):
+        draft = {"product_details": "2x3 gloss cmyk", "sku": "OLD", "price": 1, "unit_price": 1, "total": 1}
+        result = _turn(0, draft, "5000 3x4 white bopp")
         spec = result.assistant_meta["estimate_flow"]["draft"]
-        self.assertNotIn("label spec", result.reply)
         self.assertIn("3x4", spec["product_details"])
         self.assertNotIn("2x3", spec["product_details"])
         self.assertIn("5000", spec["product_details"])
         self.assertIn("bopp", spec["product_details"])
+        self.assertEqual(spec["_quantity_hint"], 5000)
         self.assertFalse(any(k in spec for k in ("sku", "price", "unit_price", "total")))
+
+    @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
+    def test_quantity_nags_reset_after_cancel(self, _fetch):
+        history, message, result = [], "I need a quote for 2x3 white bopp gloss cmyk", None
+        for _ in range(4):
+            result = handle_estimate_flow(user_message=message, conversation_history=history, conversation_id=_CID)
+            history += [{"role": "user", "content": message}, {"role": "assistant", "content": result.reply, "meta": result.assistant_meta}]
+            message = "I'm not sure yet"
+        cancelled = handle_estimate_flow(user_message="cancel", conversation_history=history, conversation_id=_CID)
+        history += [{"role": "user", "content": "cancel"}, {"role": "assistant", "content": cancelled.reply, "meta": cancelled.assistant_meta}]
+        fresh = handle_estimate_flow(user_message="I need a quote for 2x3 white bopp gloss cmyk", conversation_history=history, conversation_id=_CID)
+        self.assertIn("**quantity**", fresh.reply)
+        self.assertIn("still need", fresh.reply.lower())
+
+    @patch("fortis_cs_agent.estimate_flow.upsert_estimate_session")
+    @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session")
+    def test_size_change_is_saved_when_nags_are_exhausted(self, fetch, upsert):
+        fetch.return_value = {"status": "in_progress", "collected_data": {"product_details": "2x3 gloss cmyk"}}
+        history = []
+        for text in (
+            "**Step 1/5:** Thanks — I still need: **quantity**.",
+            "No problem. Most orders start at 1,000 labels. Send a number to price it.",
+            "No problem. Whenever you have a number, send it here and I'll price it.",
+        ):
+            history += [{"role": "user", "content": "not sure"}, {"role": "assistant", "content": text, "meta": {"estimate_flow": {"active": True, "version": 1, "pending_step_index": 0, "draft": {"product_details": "2x3 gloss cmyk"}}}}]
+        result = handle_estimate_flow(user_message="3x4 white bopp", conversation_history=history, conversation_id=_CID)
+        self.assertFalse(result.handled)
+        saved = upsert.call_args.kwargs["collected_data"]["product_details"]
+        self.assertIn("3x4", saved)
+        self.assertIn("bopp", saved)
+        self.assertNotIn("2x3", saved)
 
     @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
     def test_third_quantity_miss(self, _fetch):
