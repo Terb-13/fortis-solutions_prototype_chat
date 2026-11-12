@@ -30,16 +30,8 @@ PORTAL_QUOTE_ORIGIN = "https://fortis-solutions-group-portal-proto.vercel.app"
 
 
 def quote_page_url(estimate_id: str) -> str:
-    """Absolute public quote URL.
-
-    NEXT_PUBLIC_QUOTE_SITE_URL wins when set (local or alternate portal).
-    Otherwise links use PORTAL_QUOTE_ORIGIN. PUBLIC_BASE_URL is ignored so a
-    chat-host value cannot send shoppers to the FastAPI app, which has no
-    /quote route.
-    """
-    override = (os.getenv("NEXT_PUBLIC_QUOTE_SITE_URL") or "").strip().rstrip("/")
-    base = override or PORTAL_QUOTE_ORIGIN
-    return f"{base}/quote/{estimate_id}"
+    """Absolute public quote URL on the portal."""
+    return f"{PORTAL_QUOTE_ORIGIN}/quote/{estimate_id}"
 
 
 def insert_fortis_estimate(
