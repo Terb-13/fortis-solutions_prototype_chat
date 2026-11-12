@@ -66,7 +66,7 @@ class TestBadEstimateRegressions(unittest.TestCase):
             item = saved["item"]
             self.assertEqual(item["quantity"] * item["unit_price"], item["total"])
             self.assertEqual(item["total"], float(Decimal(cost)))
-            self.assertIn("Quoted size: 2 × 3 in.", f"{reply}\n{item['description']}")
+            self.assertEqual(item["description"], "2 × 3 in · White BOPP, gloss · CMYK")
 
 
 class TestCommaQuantityAndPricingFailure(unittest.TestCase):
