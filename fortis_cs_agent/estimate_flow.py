@@ -440,8 +440,6 @@ _EMAIL_SYNTAX_RE = re.compile(
 )
 
 # Whole-message patterns that are not usable legal / DBA business names.
-# "yes" is included: the business-name step accepted a bare yes/no and a later
-# contact-name step stored "yes" on estimate b0539f03 (conversation replay).
 _GIBBERISH_OR_META_ANSWER_RE = re.compile(
     r"(?i)^\s*("
     r"wtf|lol|lmfao|rofl|idk|idc|bruh|meh|ugh|eh|huh|hmm+|nm|nvm|"
@@ -461,10 +459,6 @@ _GIBBERISH_CONTACT_RE = re.compile(
     r")\s*[!?.]*\s*$"
 )
 
-# Company-shaped answers stay in the name slot even if they mention labels.
-_COMPANY_SUFFIX_RE = re.compile(
-    r"(?i)\b(incorporated|inc|l\.?l\.?c|llc|ltd|limited|corp|corporation|company|co)\b\.?"
-)
 
 
 def _safe_ack_snippet(text: str, *, max_len: int = 72) -> str:
@@ -477,56 +471,6 @@ def _safe_ack_snippet(text: str, *, max_len: int = 72) -> str:
     return t
 
 
-def _looks_like_product_requirement(answer: str) -> bool:
-    """
-    True when a name-step reply is still describing the label (core, roll, size),
-    not the business or the contact.
-
-    Conversation 99189173 answered the business-name prompt with
-    "roll labels, 3 inch core, no other requirements" and the contact-name
-    prompt with "yes". Those strings were stored on the estimate.
-    """
-    raw = (answer or "").strip()
-    if not raw or _COMPANY_SUFFIX_RE.search(raw):
-        return False
-    if re.search(r"(?i)\brequirements?\b", raw):
-        return True
-    if re.search(r"(?i)\b\d+(?:\.\d+)?\s*-?\s*inch(?:es)?\s+core\b", raw):
-        return True
-    if re.search(r"(?i)\broll\s+labels?\b", raw) and re.search(
-        r"(?i)\b(core|inch|size|qty|quantity)\b", raw
-    ):
-        return True
-    low = raw.lower()
-    if _extract_dimensions(low) and (
-        _STEP1_MATERIAL_RE.search(low) or re.search(r"\b(labels?|stickers?)\b", low)
-    ):
-        return True
-    if _extract_quantity(low) is not None and re.search(r"\b(labels?|stickers?)\b", low):
-        return True
-    return False
-
-
-def _product_requirement_on_name_reply(step_key: str) -> str:
-    if step_key == "contact_name":
-        return (
-            "I added that to the **product details** (roll, core, or other label specs). "
-            "I still need the **contact name** for this order.\n\n"
-            "**Step 3/5 (again):** What’s the **contact’s full name**?"
-        )
-    return (
-        "I added that to the **product details** (roll, core, or other label specs). "
-        "I still need the **business name** that should appear on the quote. "
-        "Reply **Individual** if it’s personal.\n\n"
-        "**Step 2/5 (again):** Which **business name** should we use on this paperwork?"
-    )
-
-
-def _keep_product_requirement_on_details(draft: dict[str, Any], answer: str) -> None:
-    prior = str(draft.get("product_details") or "").strip()
-    draft["product_details"] = _merge_step1_blob(prior, answer.strip())
-
-
 def _business_name_field_issue(answer: str) -> str | None:
     """
     None = acceptable. Otherwise a short code: empty, short, no_letters, gibberish, numbers_only.
@@ -537,6 +481,8 @@ def _business_name_field_issue(answer: str) -> str | None:
     low = raw.lower()
     if low in {"individual", "personal", "consumer", "self"}:
         return None
+    if _extract_dimensions(low) or re.search(r"\b(core|requirements?|inch(es)?)\b", low):
+        return "product_spec"
     if len(raw) < 3:
         return "short"
     if not re.search(r"[a-zA-Z]", raw):
@@ -556,6 +502,9 @@ def _contact_name_field_issue(answer: str) -> str | None:
     raw = (answer or "").strip()
     if not raw:
         return "empty"
+    low = raw.lower()
+    if _extract_dimensions(low) or re.search(r"\b(core|requirements?|inch(es)?)\b", low):
+        return "product_spec"
     if len(raw) < 2:
         return "short"
     if not re.search(r"[a-zA-Z]", raw):
@@ -580,6 +529,9 @@ def _address_field_issue(answer: str) -> str | None:
     return None
 
 
+_PRODUCT_SPEC_REASK = "That looks like label specs (size, core, or requirements). "
+
+
 def _invalid_business_name_reply(code: str, snippet: str) -> str:
     ack = (
         f"You sent **{snippet}** — "
@@ -594,6 +546,8 @@ def _invalid_business_name_reply(code: str, snippet: str) -> str:
         body = ack + "I need at least some **letters** (a real company or brand name). "
     elif code == "numbers_only":
         body = ack + "a **business name** can’t be only numbers. "
+    elif code == "product_spec":
+        body = ack + _PRODUCT_SPEC_REASK
     else:
         body = ack + "that doesn’t read like a **company or organization name**. "
 
@@ -614,6 +568,8 @@ def _invalid_contact_name_reply(code: str, snippet: str) -> str:
         lead = ack + "I need a **person’s name** (letters), not only numbers or symbols. "
     elif code == "numbers_only":
         lead = ack + "the **contact** should be a person’s name, not only digits. "
+    elif code == "product_spec":
+        lead = ack + _PRODUCT_SPEC_REASK
     else:
         lead = ack + "that doesn’t look like someone’s **name** (first + last is ideal). "
 
@@ -678,107 +634,6 @@ def _cost_key_human_label(cost_key: str) -> str:
         if cost_key == key:
             return lab
     return cost_key.replace("cost_", "").replace("_", " ")
-
-
-def _format_dim(value: float) -> str:
-    text = f"{value:.4f}".rstrip("0").rstrip(".")
-    return text or "0"
-
-
-def _format_size_pair(width: float, height: float) -> str:
-    return f"{_format_dim(width)} × {_format_dim(height)} in."
-
-
-def _requested_size_pair(text: str) -> tuple[float, float] | None:
-    match = re.search(
-        r"(\d+(?:\.\d+)?)\s*(?:x|×|✕|╳|\*|by)\s*(\d+(?:\.\d+)?)",
-        (text or "").lower(),
-        re.IGNORECASE,
-    )
-    if not match:
-        return None
-    return float(match.group(1)), float(match.group(2))
-
-
-def _row_size_pair(row: dict[str, Any]) -> tuple[float, float] | None:
-    try:
-        width = float(row.get("width_in"))
-        height = float(row.get("height_in"))
-    except (TypeError, ValueError):
-        return None
-    if width <= 0 or height <= 0:
-        return None
-    return width, height
-
-
-def _sizes_equivalent(requested: tuple[float, float], actual: tuple[float, float], tol: float = 0.02) -> bool:
-    rw, rh = requested
-    aw, ah = actual
-    direct = abs(aw - rw) <= tol and abs(ah - rh) <= tol
-    swapped = abs(aw - rh) <= tol and abs(ah - rw) <= tol
-    return direct or swapped
-
-
-def _quoted_size_clause(row: dict[str, Any], product_blob: str) -> tuple[str, str]:
-    """
-    Return (summary bullet body, description fragment).
-
-    When the catalog row is a different size than the request, both strings
-    name the size actually being quoted.
-    """
-    actual = _row_size_pair(row)
-    if actual is None:
-        return "", ""
-    quoted = _format_size_pair(*actual)
-    requested = _requested_size_pair(product_blob)
-    if requested and not _sizes_equivalent(requested, actual):
-        asked = _format_size_pair(*requested)
-        summary = (
-            f"**Quoted size:** {quoted}. You asked for {asked}. "
-            f"This quote uses {quoted}, the nearest Quick Ship size in the catalog."
-        )
-        detail = f"Quoted size: {quoted} (requested {asked}; nearest Quick Ship size)"
-        return summary, detail
-    summary = f"**Quoted size:** {quoted}."
-    detail = f"Quoted size: {quoted}"
-    return summary, detail
-
-
-def unit_price_matching_total(total: Decimal, quantity: int) -> Decimal:
-    """
-    Smallest decimal unit price such that unit × quantity equals ``total``.
-
-    Catalog totals stay exact. Rounding the unit to 4 places turns
-    5,000 × $0.01544 ($77.20) into $0.0154, which multiplies back to $77.00.
-    """
-    qty = Decimal(int(quantity))
-    if qty <= 0:
-        raise ValueError("quantity must be positive")
-    unit = total / qty
-    for places in range(0, 12):
-        quantum = Decimal(1).scaleb(-places)
-        candidate = unit.quantize(quantum)
-        if candidate * qty == total:
-            return candidate
-    return unit
-
-
-def _json_number(amount: Decimal) -> float:
-    """JSON number that keeps the decimal text (0.01544 stays 0.01544)."""
-    return float(format(amount, "f"))
-
-
-def _format_unit_price(unit: Decimal) -> str:
-    text = format(unit, "f")
-    if "." in text:
-        whole, frac = text.split(".", 1)
-        frac = frac.rstrip("0")
-        if len(frac) < 2:
-            frac = frac.ljust(2, "0")
-        text = f"{whole}.{frac}"
-    else:
-        text = f"{text}.00"
-    return f"${text}"
 
 
 def _catalog_match_sentence(row: dict[str, Any]) -> str | None:
@@ -922,14 +777,14 @@ def _persist_structured_estimate(
         return ("Catalog returned a zero/blank total — double-check qty vs Quick Ship breakpoints.", None)
 
     stored_total = total_val.quantize(Decimal("0.01"))
-    unit_val = unit_price_matching_total(stored_total, int(qty))
+    unit_price = float(stored_total / int(qty))
     sku = (str(row.get("sku") or "").strip()) or "CATALOG_ROW"
-    product_blob = str(draft.get("product_details") or "").strip()
-    size_summary, size_detail = _quoted_size_clause(row, product_blob)
+    w, h = float(row.get("width_in") or 0), float(row.get("height_in") or 0)
+    quoted_size = f"Quoted size: {w:g} × {h:g} in."
     desc_parts = [
         str(row.get("comment_application") or row.get("description") or "").strip(),
-        size_detail,
-        product_blob,
+        quoted_size,
+        str(draft.get("product_details") or "").strip(),
     ]
     desc = " | ".join(p for p in desc_parts if p)[:650]
 
@@ -938,8 +793,8 @@ def _persist_structured_estimate(
             "sku": sku[:240],
             "description": desc,
             "quantity": float(qty),
-            "unit_price": _json_number(unit_val),
-            "total": _json_number(stored_total),
+            "unit_price": unit_price,
+            "total": float(stored_total),
         }
     ]
 
@@ -983,7 +838,7 @@ def _persist_structured_estimate(
         mat_fin = "See catalog row on quote"
 
     total_str = f"${float(stored_total):,.2f}"
-    unit_str = _format_unit_price(unit_val)
+    unit_str = "$" + re.sub(r"(\.\d\d\d*?)0+$", r"\1", f"{unit_price:.5f}")
     qty_str = f"{int(qty):,}"
 
     tier_line = (
@@ -992,14 +847,13 @@ def _persist_structured_estimate(
 
     match_txt = _catalog_match_sentence(row)
     lines_note = f"\n\n{match_txt}" if match_txt else ""
-    size_line = f"- {size_summary}\n" if size_summary else ""
 
     friendly = (
         "Thank you — your structured **Quick Ship** estimate has been saved. "
         "Below is a concise pricing summary matched to our Quick Ship pricing grid.\n\n"
         "### Pricing summary\n"
         f"- **SKU:** `{sku}`\n"
-        f"{size_line}"
+        f"- {quoted_size}\n"
         f"- **Quantity:** {qty_str} labels\n"
         f"- **Unit price:** {unit_str} per label (extended total shown below divided by qty)\n"
         f"- **Line total:** {total_str}\n"
@@ -1294,13 +1148,6 @@ def handle_estimate_flow(
                     estimate_id=None,
                 )
     elif step_key == "business_name":
-        if _looks_like_product_requirement(answer):
-            _keep_product_requirement_on_details(draft, answer)
-            return EstimateFlowResult(
-                handled=True,
-                reply=_product_requirement_on_name_reply(step_key),
-                assistant_meta=_meta_payload(draft, pending_idx),
-            )
         issue = _business_name_field_issue(answer)
         if issue:
             sn = _safe_ack_snippet(answer)
@@ -1311,13 +1158,6 @@ def handle_estimate_flow(
             )
         draft["business_name"] = answer
     elif step_key == "contact_name":
-        if _looks_like_product_requirement(answer):
-            _keep_product_requirement_on_details(draft, answer)
-            return EstimateFlowResult(
-                handled=True,
-                reply=_product_requirement_on_name_reply(step_key),
-                assistant_meta=_meta_payload(draft, pending_idx),
-            )
         issue = _contact_name_field_issue(answer)
         if issue:
             sn = _safe_ack_snippet(answer)
