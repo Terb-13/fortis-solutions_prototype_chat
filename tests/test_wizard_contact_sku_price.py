@@ -66,7 +66,28 @@ class TestBadEstimateRegressions(unittest.TestCase):
             item = saved["item"]
             self.assertEqual(item["quantity"] * item["unit_price"], item["total"])
             self.assertEqual(item["total"], float(Decimal(cost)))
-            self.assertIn("Quoted size: 2 × 3 in.", f"{reply}\n{item['description']}")
+            self.assertEqual(item["description"], "2 × 3 in · White BOPP, gloss · CMYK")
+
+
+class TestSecondQuantityMiss(unittest.TestCase):
+    @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
+    def test_second_miss_does_not_repeat_step1(self, _fetch):
+        first = handle_estimate_flow(
+            user_message="I need a quote for 2x3 white bopp gloss cmyk",
+            conversation_history=[],
+            conversation_id=_CID,
+        )
+        self.assertIn("**quantity**", first.reply)
+        second = handle_estimate_flow(
+            user_message="I'm not sure yet",
+            conversation_history=[{"role": "assistant", "content": first.reply, "meta": first.assistant_meta}],
+            conversation_id=_CID,
+        )
+        self.assertEqual(
+            second.reply,
+            "No problem. Most orders start at 1,000 labels. Send a number to price it.",
+        )
+        self.assertNotEqual(second.reply.strip(), first.reply.strip())
 
 
 class TestCommaQuantityAndPricingFailure(unittest.TestCase):

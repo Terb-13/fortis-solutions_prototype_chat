@@ -34,7 +34,7 @@ from fortis_cs_agent.tools import execute_agent_tool, quote_page_url
 logger = logging.getLogger(__name__)
 
 # Bumped when changing estimate wizard behavior; exposed on GET /health for deploy verification.
-ESTIMATE_FLOW_BUILD = "wizard-v17-exact-size-min-tier"
+ESTIMATE_FLOW_BUILD = "wizard-v18-clean-line-description"
 
 _STEPS = ("product_details", "business_name", "contact_name", "email", "address")
 _DEFAULT_NOTES = "This quote does not include shipping or taxes. Prices are valid for 30 days."
@@ -633,12 +633,24 @@ def latest_estimate_flow_snapshot(history_rows: list[dict[str, Any]]) -> tuple[d
     return _infer_snapshot_from_assistant_content(history_rows)
 
 
-def _step1_continue_reply(miss_txt: str) -> str:
-    """Step 1 partial progress without echoing the user’s prior line back to them."""
-    return (
+def _step1_continue_reply(miss_txt: str, history: list[dict[str, Any]] | None = None) -> str:
+    """Step 1 partial progress. A second identical quantity ask uses the fallback."""
+    reply = (
         f"**Step 1/5:** Thanks — I still need: {miss_txt}.\n\n"
         "Send what’s missing in one line (or another short line if that’s easier—I’ll combine them)."
     )
+    if "**quantity**" not in miss_txt:
+        return reply
+    last = ""
+    for row in reversed(history or []):
+        if row.get("role") == "assistant":
+            last = (row.get("content") or "").strip()
+            break
+    if last == reply.strip():
+        return (
+            "No problem. Most orders start at 1,000 labels. Send a number to price it."
+        )
+    return reply
 
 
 def _resolve_wizard_snap(
@@ -681,7 +693,7 @@ def _prompt_for_pending_index(idx: int) -> str:
     step = _STEPS[idx]
     if step == "product_details":
         return (
-            "Got it — I’ll collect a structured Quick Ship estimate.\n\n"
+            "Got it — I’ll collect a quote.\n\n"
             "**Step 1/5:** In one line send **quantity**, **size (W×H in.)**, **material**, "
             "**finish**, and **print colors**."
         )
@@ -735,13 +747,14 @@ def _persist_structured_estimate(
     unit_price = float(stored_total / int(qty))
     sku = (str(row.get("sku") or "").strip()) or "CATALOG_ROW"
     w, h = float(row.get("width_in") or 0), float(row.get("height_in") or 0)
-    quoted_size = f"Quoted size: {w:g} × {h:g} in." if w and h else ""
-    desc_parts = [
-        str(row.get("comment_application") or row.get("description") or "").strip(),
-        quoted_size,
-        str(draft.get("product_details") or "").strip(),
-    ]
-    desc = " | ".join(p for p in desc_parts if p)[:650]
+    mat = str(row.get("material") or "").strip()
+    fin = str(row.get("finish") or "").strip()
+    short_mat = re.sub(r"^\d+(\.\d+)?\s*mil\s*", "", mat.split("/")[0]).strip()
+    material_line = ", ".join(part for part in (short_mat, fin.strip().lower()) if part)
+    size_label = f"{w:g} × {h:g} in" if w and h else ""
+    color_m = _STEP1_COLORS_RE.search(str(blob))
+    color = color_m.group(0).strip() if color_m else ""
+    desc = " · ".join(part for part in (size_label, material_line, color) if part)[:650]
 
     items = [
         {
@@ -781,16 +794,12 @@ def _persist_structured_estimate(
     if not eid:
         return ("Estimate save failed — no estimate id returned.", None)
     link = quote_page_url(eid)
-    mat = str(row.get("material") or "").strip()
-    fin = str(row.get("finish") or "").strip()
     total_str = f"${float(stored_total):,.2f}"
     unit_str = "$" + re.sub(r"(\.\d\d\d*?)0+$", r"\1", f"{unit_price:.5f}")
     qty_str = f"{int(qty):,}"
-    short_mat = re.sub(r"^\d+(\.\d+)?\s*mil\s*", "", mat.split("/")[0]).strip()
-    material_line = ", ".join(part for part in (short_mat, fin.strip().lower()) if part)
     lines = ["Your quote is ready."]
-    if w and h:
-        lines.append(f"Size {w:g} × {h:g} in")
+    if size_label:
+        lines.append(f"Size {size_label}")
     lines.append(f"Quantity {qty_str}")
     if material_line:
         lines.append(f"Material {material_line}")
@@ -927,7 +936,7 @@ def handle_estimate_flow(
                     miss_txt = ", ".join(_step1_missing_parts(blob_low))
                     return EstimateFlowResult(
                         handled=True,
-                        reply=_step1_continue_reply(miss_txt),
+                        reply=_step1_continue_reply(miss_txt, conversation_history),
                         assistant_meta=_meta_payload(dict(labeled_draft), 0),
                         estimate_id=None,
                     )
@@ -956,7 +965,7 @@ def handle_estimate_flow(
             miss_txt = ", ".join(_step1_missing_parts(msg_lower))
             return EstimateFlowResult(
                 handled=True,
-                reply=_step1_continue_reply(miss_txt),
+                reply=_step1_continue_reply(miss_txt, conversation_history),
                 assistant_meta=_meta_payload(draft, pending_step_index=0),
                 estimate_id=None,
             )
@@ -972,7 +981,7 @@ def handle_estimate_flow(
                 miss_txt = ", ".join(_step1_missing_parts(msg_lower))
                 return EstimateFlowResult(
                     handled=True,
-                    reply=_step1_continue_reply(miss_txt),
+                    reply=_step1_continue_reply(miss_txt, conversation_history),
                     assistant_meta=_meta_payload(draft, pending_step_index=0),
                     estimate_id=None,
                 )
@@ -1047,7 +1056,7 @@ def handle_estimate_flow(
                 miss_txt = ", ".join(_step1_missing_parts(low))
                 return EstimateFlowResult(
                     handled=True,
-                    reply=_step1_continue_reply(miss_txt),
+                    reply=_step1_continue_reply(miss_txt, conversation_history),
                     assistant_meta=_meta_payload(draft, pending_step_index=0),
                     estimate_id=None,
                 )
@@ -1071,7 +1080,7 @@ def handle_estimate_flow(
                 miss_txt = ", ".join(_step1_missing_parts(low))
                 return EstimateFlowResult(
                     handled=True,
-                    reply=_step1_continue_reply(miss_txt),
+                    reply=_step1_continue_reply(miss_txt, conversation_history),
                     assistant_meta=_meta_payload(draft, pending_step_index=0),
                     estimate_id=None,
                 )
