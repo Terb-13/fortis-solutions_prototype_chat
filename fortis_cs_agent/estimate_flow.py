@@ -1046,7 +1046,7 @@ def handle_estimate_flow(
     new_size = _extract_size_tuple(answer.lower())
     old_size = _extract_size_tuple(str(draft.get("product_details") or "").lower())
     if new_size and old_size and (abs(new_size[0] - old_size[0]) > 0.02 or abs(new_size[1] - old_size[1]) > 0.02):
-        for key in ("sku", "price", "unit_price", "total", "_quantity_hint"):
+        for key in ("sku", "price", "unit_price", "total"):
             draft.pop(key, None)
         swapped = re.sub(
             r"(\d+(?:\.\d+)?)\s*(?:x|×|\bby\b)\s*(\d+(?:\.\d+)?)",
@@ -1059,6 +1059,8 @@ def handle_estimate_flow(
             r"(\d+(?:\.\d+)?)\s*(?:x|×|\bby\b)\s*(\d+(?:\.\d+)?)", "", answer, count=1, flags=re.IGNORECASE
         ).strip(" ,;")
         draft["product_details"] = _merge_step1_blob(rest, swapped) if rest else swapped
+        if q := _extract_quantity(rest.lower()):
+            draft["_quantity_hint"] = q
         low = str(draft["product_details"]).lower()
         fp = _first_pending_step_index(draft)
         if fp == 0:

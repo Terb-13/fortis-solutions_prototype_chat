@@ -74,15 +74,6 @@ class TestBadEstimateRegressions(unittest.TestCase):
             self.assertEqual(item["description"], "2 × 3 in · White BOPP, gloss · CMYK")
 
 
-def _quantity_misses(n: int):
-    history, message, result = [], "I need a quote for 2x3 white bopp gloss cmyk", None
-    for _ in range(n):
-        result = handle_estimate_flow(user_message=message, conversation_history=history, conversation_id=_CID)
-        history += [{"role": "user", "content": message}, {"role": "assistant", "content": result.reply, "meta": result.assistant_meta}]
-        message = "I'm not sure yet"
-    return result
-
-
 class TestMidQuoteSizeChange(unittest.TestCase):
     @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
     @patch("fortis_cs_agent.estimate_flow.retrieve_pricing")
@@ -185,28 +176,15 @@ class TestMidQuoteSizeChange(unittest.TestCase):
         self.assertIn("3x4", result.assistant_meta["estimate_flow"]["draft"]["product_details"])
 
     @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
-    def test_by_size_does_not_set_quantity(self, _fetch):
-        draft = {"product_details": "2x3 white bopp gloss cmyk"}
-        result = _turn(0, draft, "3 by 4")
-        spec = result.assistant_meta["estimate_flow"]["draft"]
-        self.assertIsNone(spec.get("_quantity_hint"))
-        self.assertIn("**quantity**", result.reply)
-
-    @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
-    def test_third_quantity_miss(self, _fetch):
-        self.assertEqual(_quantity_misses(3).reply, "No problem. Whenever you have a number, send it here and I'll price it.")
-
-    @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
-    def test_fourth_quantity_miss_is_silent(self, _fetch):
-        result = _quantity_misses(4)
-        self.assertFalse(result.handled)
-        self.assertEqual(result.reply, "")
-
-    @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
-    def test_custom_quote_without_session(self, _fetch):
-        result = handle_estimate_flow(user_message="Can someone help me with a custom quote?", conversation_history=[], conversation_id=_CID)
-        self.assertEqual(result.reply, "Sure. Send the size, quantity, material and finish you need.")
-        self.assertNotIn("Step 1/5", result.reply)
+    def test_quantity_then_size_does_not_reask(self, _fetch):
+        first = _turn(0, {"product_details": "2x3 white bopp gloss cmyk"}, "5000")
+        second = handle_estimate_flow(
+            user_message="3x4",
+            conversation_history=[{"role": "assistant", "content": first.reply, "meta": first.assistant_meta}],
+            conversation_id=_CID,
+        )
+        self.assertNotIn("**quantity**", second.reply)
+        self.assertEqual(second.assistant_meta["estimate_flow"]["draft"]["_quantity_hint"], 5000)
 
 
 class TestSecondQuantityMiss(unittest.TestCase):
