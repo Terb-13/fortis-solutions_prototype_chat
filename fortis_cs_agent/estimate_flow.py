@@ -34,7 +34,7 @@ from fortis_cs_agent.tools import execute_agent_tool, quote_page_url
 logger = logging.getLogger(__name__)
 
 # Bumped when changing estimate wizard behavior; exposed on GET /health for deploy verification.
-ESTIMATE_FLOW_BUILD = "wizard-v14-topic-shift-no-echo"
+ESTIMATE_FLOW_BUILD = "wizard-v15-name-slot-exact-size"
 
 _STEPS = ("product_details", "business_name", "contact_name", "email", "address")
 _DEFAULT_NOTES = "This quote does not include shipping or taxes. Prices are valid for 30 days."
@@ -443,7 +443,7 @@ _EMAIL_SYNTAX_RE = re.compile(
 _GIBBERISH_OR_META_ANSWER_RE = re.compile(
     r"(?i)^\s*("
     r"wtf|lol|lmfao|rofl|idk|idc|bruh|meh|ugh|eh|huh|hmm+|nm|nvm|"
-    r"n/?a|none|null|nothing|no\s*$|nah|yep|yea|yeah|sure|maybe|ok+|k\.?|"
+    r"n/?a|none|null|nothing|no|nah|nope|yep|yea|yeah|yes|sure|maybe|ok+|k\.?|skip|"
     r"asdf+|qwerty|foo|bar|xxx+|abc123|1234|test\s*123|"
     r"help|why|because|whatever|dunno|i\s*don'?t\s*know|guess|"
     r"idk\??|wth|ffs|omg"
@@ -454,9 +454,11 @@ _GIBBERISH_OR_META_ANSWER_RE = re.compile(
 _GIBBERISH_CONTACT_RE = re.compile(
     r"(?i)^\s*("
     r"wtf|lol|asdf|foo|bar|xxx|test|none|n/?a|idk|nobody|someone|anyone|meh|"
-    r"your\s+mom|admin|user|customer|sir|madam|dude|bro"
+    r"your\s+mom|admin|user|customer|sir|madam|dude|bro|"
+    r"yes|yep|yea|yeah|no|nope|nah|ok+|sure|skip"
     r")\s*[!?.]*\s*$"
 )
+
 
 
 def _safe_ack_snippet(text: str, *, max_len: int = 72) -> str:
@@ -479,6 +481,8 @@ def _business_name_field_issue(answer: str) -> str | None:
     low = raw.lower()
     if low in {"individual", "personal", "consumer", "self"}:
         return None
+    if _extract_dimensions(low) or re.search(r"\b(core|requirements?|inch(es)?)\b", low):
+        return "product_spec"
     if len(raw) < 3:
         return "short"
     if not re.search(r"[a-zA-Z]", raw):
@@ -498,6 +502,9 @@ def _contact_name_field_issue(answer: str) -> str | None:
     raw = (answer or "").strip()
     if not raw:
         return "empty"
+    low = raw.lower()
+    if _extract_dimensions(low) or re.search(r"\b(core|requirements?|inch(es)?)\b", low):
+        return "product_spec"
     if len(raw) < 2:
         return "short"
     if not re.search(r"[a-zA-Z]", raw):
@@ -522,6 +529,9 @@ def _address_field_issue(answer: str) -> str | None:
     return None
 
 
+_PRODUCT_SPEC_REASK = "That looks like label specs (size, core, or requirements). "
+
+
 def _invalid_business_name_reply(code: str, snippet: str) -> str:
     ack = (
         f"You sent **{snippet}** — "
@@ -536,6 +546,8 @@ def _invalid_business_name_reply(code: str, snippet: str) -> str:
         body = ack + "I need at least some **letters** (a real company or brand name). "
     elif code == "numbers_only":
         body = ack + "a **business name** can’t be only numbers. "
+    elif code == "product_spec":
+        body = ack + _PRODUCT_SPEC_REASK
     else:
         body = ack + "that doesn’t read like a **company or organization name**. "
 
@@ -556,6 +568,8 @@ def _invalid_contact_name_reply(code: str, snippet: str) -> str:
         lead = ack + "I need a **person’s name** (letters), not only numbers or symbols. "
     elif code == "numbers_only":
         lead = ack + "the **contact** should be a person’s name, not only digits. "
+    elif code == "product_spec":
+        lead = ack + _PRODUCT_SPEC_REASK
     else:
         lead = ack + "that doesn’t look like someone’s **name** (first + last is ideal). "
 
@@ -762,10 +776,14 @@ def _persist_structured_estimate(
     if total_val <= 0:
         return ("Catalog returned a zero/blank total — double-check qty vs Quick Ship breakpoints.", None)
 
-    unit_val = total_val / Decimal(int(qty))
+    stored_total = total_val.quantize(Decimal("0.01"))
+    unit_price = float(stored_total / int(qty))
     sku = (str(row.get("sku") or "").strip()) or "CATALOG_ROW"
+    w, h = float(row.get("width_in") or 0), float(row.get("height_in") or 0)
+    quoted_size = f"Quoted size: {w:g} × {h:g} in."
     desc_parts = [
         str(row.get("comment_application") or row.get("description") or "").strip(),
+        quoted_size,
         str(draft.get("product_details") or "").strip(),
     ]
     desc = " | ".join(p for p in desc_parts if p)[:650]
@@ -775,8 +793,8 @@ def _persist_structured_estimate(
             "sku": sku[:240],
             "description": desc,
             "quantity": float(qty),
-            "unit_price": float(unit_val.quantize(Decimal("0.0001"))),
-            "total": float(total_val.quantize(Decimal("0.01"))),
+            "unit_price": unit_price,
+            "total": float(stored_total),
         }
     ]
 
@@ -819,8 +837,8 @@ def _persist_structured_estimate(
     else:
         mat_fin = "See catalog row on quote"
 
-    total_str = f"${float(total_val):,.2f}"
-    unit_str = f"${float(unit_val.quantize(Decimal('0.0001'))):,.4f}"
+    total_str = f"${float(stored_total):,.2f}"
+    unit_str = "$" + re.sub(r"(\.\d\d\d*?)0+$", r"\1", f"{unit_price:.5f}")
     qty_str = f"{int(qty):,}"
 
     tier_line = (
@@ -835,6 +853,7 @@ def _persist_structured_estimate(
         "Below is a concise pricing summary matched to our Quick Ship pricing grid.\n\n"
         "### Pricing summary\n"
         f"- **SKU:** `{sku}`\n"
+        f"- {quoted_size}\n"
         f"- **Quantity:** {qty_str} labels\n"
         f"- **Unit price:** {unit_str} per label (extended total shown below divided by qty)\n"
         f"- **Line total:** {total_str}\n"

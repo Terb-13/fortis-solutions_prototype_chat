@@ -515,7 +515,26 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
         except Exception:
             logger.warning("retrieve_pricing SKU lookup failed sku=%r", sku, exc_info=True)
 
-    # --- 2) Material ---
+    # Exact size before material so 2x3 white BOPP is not the first BOPP SKU.
+    size_tuple = _extract_size_tuple(query_lower)
+    if size_tuple:
+        tw, th, exact_tol = *size_tuple, 0.02
+        window = (
+            f"and(width_in.gte.{tw - exact_tol:.4f},width_in.lte.{tw + exact_tol:.4f},height_in.gte.{th - exact_tol:.4f},height_in.lte.{th + exact_tol:.4f}),"
+            f"and(width_in.gte.{th - exact_tol:.4f},width_in.lte.{th + exact_tol:.4f},height_in.gte.{tw - exact_tol:.4f},height_in.lte.{tw + exact_tol:.4f})"
+        )
+        try:
+            res = supabase.table(tbl).select("*").or_(window).limit(max(limit * 4, 12)).execute()
+            exact = [
+                dict(r) for r in (res.data or [])
+                if _row_matches_size_tolerance(r, tw, th, exact_tol) or _row_matches_size_tolerance(r, th, tw, exact_tol)
+            ]
+            if exact:
+                return _annotate_pricing_rows(exact[:limit], query_lower, how="size", tol=tol)
+        except Exception:
+            logger.warning("retrieve_pricing exact-size query failed", exc_info=True)
+
+    # --- 2) Material (skipped when a size was requested) ---
     results: list[dict[str, Any]] = []
     seen_mat: set[tuple[Any, ...]] = set()
 
@@ -528,28 +547,29 @@ def retrieve_pricing(query: str, limit: int = 5) -> list[dict]:
         results.append(row)
         return len(results) >= limit
 
-    for material in mentioned_materials[:3]:
-        try:
-            res = (
-                supabase.table(tbl)
-                .select("*")
-                .ilike("material", f"%{material}%")
-                .limit(max(limit * 2, 8))
-                .execute()
+    if not size_tuple:
+        for material in mentioned_materials[:3]:
+            try:
+                res = (
+                    supabase.table(tbl)
+                    .select("*")
+                    .ilike("material", f"%{material}%")
+                    .limit(max(limit * 2, 8))
+                    .execute()
+                )
+            except Exception:
+                logger.warning("retrieve_pricing material filter failed material=%r", material, exc_info=True)
+                continue
+            scored = sorted(
+                res.data or [],
+                key=lambda r: (-_material_match_score(query_lower, str(r.get("material") or "")), str(r.get("sku"))),
             )
-        except Exception:
-            logger.warning("retrieve_pricing material filter failed material=%r", material, exc_info=True)
-            continue
-        scored = sorted(
-            res.data or [],
-            key=lambda r: (-_material_match_score(query_lower, str(r.get("material") or "")), str(r.get("sku"))),
-        )
-        for row in scored:
-            if _take_material_row(row):
-                return _annotate_pricing_rows(results[:limit], query_lower, how="material", tol=tol)
+            for row in scored:
+                if _take_material_row(row):
+                    return _annotate_pricing_rows(results[:limit], query_lower, how="material", tol=tol)
 
-    if results:
-        return _annotate_pricing_rows(results[:limit], query_lower, how="material", tol=tol)
+        if results:
+            return _annotate_pricing_rows(results[:limit], query_lower, how="material", tol=tol)
 
     # --- 3) Size bucket + nearest-match (WxH × by) ---
     size_tuple_pre = _extract_size_tuple(query_lower)
