@@ -422,8 +422,7 @@ def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
 
     query_lower = query.lower()
     qty = _extract_quantity(query_lower)
-
-    qty_key = _qty_to_cost_key(qty) if qty is not None else "cost_1000"
+    qty_key = _qty_to_cost_key(qty) if qty is not None else None
 
     needs_material_prompt = not _user_mentioned_material(query_lower)
     size_tuple = _extract_size_tuple(query_lower)
@@ -448,11 +447,13 @@ def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
         description = (row.get("comment_application") or row.get("description") or "").strip() or "No description"
         material = row.get("material") or "N/A"
         finish = row.get("finish") or "N/A"
-        selected_cost = row.get(qty_key)
-        cost_label = qty_key.replace("cost_", "").upper()
+        cost_note = ""
+        if qty_key:
+            selected_cost = row.get(qty_key)
+            cost_label = qty_key.replace("cost_", "").upper()
+            cost_note = f" | Cost@{cost_label}: {selected_cost}"
         lines.append(
-            f"- {sku} | {description} | Material: {material} | Finish: {finish} | "
-            f"Cost@{cost_label}: {selected_cost}"
+            f"- {sku} | {description} | Material: {material} | Finish: {finish}{cost_note}"
         )
 
     distinct_materials: list[str] = []
@@ -565,11 +566,14 @@ def format_pricing_context(rows: list[dict[str, Any]], query: str) -> str:
             "keep BOPP explanation to one short clause."
         )
 
-    parts.append(
-        "Quote completion: When required customer fields + SKU detail are settled, assistants emit STRICT JSON payloads "
-        "for the backend (see system prompt). Map totals/unit_price ONLY from Cost@ tiers listed above—never hallucinate SKU "
-        "dollar amounts in conversational prose beforehand."
-    )
+    if qty is None:
+        parts.append("Do not quote a total. Ask the shopper for the quantity they need.")
+    else:
+        parts.append(
+            "Quote completion: When required customer fields + SKU detail are settled, assistants emit STRICT JSON payloads "
+            "for the backend (see system prompt). Map totals/unit_price ONLY from Cost@ tiers listed above—never hallucinate SKU "
+            "dollar amounts in conversational prose beforehand."
+        )
     parts.append(
         "PDF alternate only: Reserve generate_estimate_pdf for explicit downloadable PDF tooling outside structured JSON quotes."
     )

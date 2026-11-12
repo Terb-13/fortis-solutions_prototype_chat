@@ -124,6 +124,46 @@ class TestRunAgentTurnKnowledge(unittest.IsolatedAsyncioTestCase):
         self.assertIn("size and quantity", last_user_msg)
         self.assertNotIn("STICKER_", last_user_msg)
 
+    @patch("fortis_cs_agent.api._grok_chat", new_callable=AsyncMock)
+    @patch("fortis_cs_agent.api.retrieve_faq")
+    @patch("fortis_cs_agent.api.retrieve_knowledge")
+    @patch("fortis_cs_agent.api.retrieve_pricing")
+    @patch("fortis_cs_agent.api.load_recent_messages")
+    async def test_size_without_quantity_has_no_default_total(
+        self,
+        load_msgs: MagicMock,
+        ret_pricing: MagicMock,
+        ret_kn: MagicMock,
+        ret_faq: MagicMock,
+        grok: AsyncMock,
+    ) -> None:
+        from fortis_cs_agent.api import run_agent_turn
+
+        load_msgs.return_value = []
+        ret_pricing.return_value = [
+            {
+                "sku": "STICKER_2x3_WBGP_G",
+                "material": "2.6mil White BOPP / GPX / 40# SCK",
+                "finish": "Gloss",
+                "width_in": 2,
+                "height_in": 3,
+                "cost_1000": 83.90,
+                "comment_application": "2x3 White BOPP",
+            }
+        ]
+        grok.return_value = {"choices": [{"message": {"content": "Test reply"}}]}
+
+        await run_agent_turn("how much for 2x3 labels?", conversation_id="cid-1")
+
+        ret_pricing.assert_called_once()
+        last_user_msg = grok.call_args.args[0][-1]["content"]
+        self.assertIn("STICKER_2x3_WBGP_G", last_user_msg)
+        self.assertNotIn("cost_1000", last_user_msg.lower())
+        self.assertNotIn("Cost@", last_user_msg)
+        self.assertNotIn("83.9", last_user_msg)
+        self.assertIn("Do not quote a total", last_user_msg)
+        self.assertIn("quantity", last_user_msg)
+
 
 if __name__ == "__main__":
     unittest.main()
