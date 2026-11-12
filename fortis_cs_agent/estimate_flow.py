@@ -34,7 +34,7 @@ from fortis_cs_agent.tools import execute_agent_tool, quote_page_url
 logger = logging.getLogger(__name__)
 
 # Bumped when changing estimate wizard behavior; exposed on GET /health for deploy verification.
-ESTIMATE_FLOW_BUILD = "wizard-v18-clean-line-description"
+ESTIMATE_FLOW_BUILD = "wizard-v19-size-change-bugbot-fixes"
 
 _STEPS = ("product_details", "business_name", "contact_name", "email", "address")
 _DEFAULT_NOTES = "This quote does not include shipping or taxes. Prices are valid for 30 days."
