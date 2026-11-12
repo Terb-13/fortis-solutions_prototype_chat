@@ -1055,6 +1055,7 @@ def handle_estimate_flow(
             count=1,
             flags=re.IGNORECASE,
         )
+        step_key = "product_details"
 
     if step_key == "product_details":
         if _looks_like_labeled_estimate_form(raw):
