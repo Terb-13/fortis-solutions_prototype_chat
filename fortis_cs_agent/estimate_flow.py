@@ -653,7 +653,7 @@ def _step1_continue_reply(miss_txt: str, history: list[dict[str, Any]] | None = 
         if isinstance(flow, dict) and flow.get("active") is False:
             n = 0
             continue
-        if text in (_QTY_THOUSAND, _QTY_LATER) or ("**quantity**" in text and "still need" in text.lower()):
+        if text.endswith((_QTY_THOUSAND, _QTY_LATER)) or ("**quantity**" in text and "still need" in text.lower()):
             n += 1
     return [reply, _QTY_THOUSAND, _QTY_LATER][n] if n < 3 else None
 

@@ -187,6 +187,19 @@ class TestMidQuoteSizeChange(unittest.TestCase):
         self.assertTrue(result.reply.startswith("Got it, updated to 3 × 2 in, 2,000 labels.\n\n"))
 
     @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
+    def test_size_change_without_quantity_advances_the_nag(self, _fetch):
+        first = _turn(0, {"product_details": "2x3 white bopp gloss cmyk"}, "3x4")
+        self.assertTrue(first.reply.startswith("Got it, updated to 3 × 4 in.\n\n"))
+        self.assertIn("**quantity**", first.reply)
+        second = handle_estimate_flow(
+            user_message="I'm not sure yet",
+            conversation_history=[{"role": "assistant", "content": first.reply, "meta": first.assistant_meta}],
+            conversation_id=_CID,
+        )
+        self.assertEqual(second.reply, "No problem. Most orders start at 1,000 labels. Send a number to price it.")
+        self.assertNotIn("still need", second.reply.lower())
+
+    @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
     def test_quantity_then_size_does_not_reask(self, _fetch):
         first = _turn(0, {"product_details": "2x3 white bopp gloss cmyk"}, "5000")
         second = handle_estimate_flow(
