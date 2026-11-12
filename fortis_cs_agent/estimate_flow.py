@@ -34,7 +34,7 @@ from fortis_cs_agent.tools import execute_agent_tool, quote_page_url
 logger = logging.getLogger(__name__)
 
 # Bumped when changing estimate wizard behavior; exposed on GET /health for deploy verification.
-ESTIMATE_FLOW_BUILD = "wizard-v19-size-change-bugbot-fixes"
+ESTIMATE_FLOW_BUILD = "wizard-v20-spec-change-confirm"
 
 _STEPS = ("product_details", "business_name", "contact_name", "email", "address")
 _DEFAULT_NOTES = "This quote does not include shipping or taxes. Prices are valid for 30 days."
@@ -1059,15 +1059,18 @@ def handle_estimate_flow(
             r"(\d+(?:\.\d+)?)\s*(?:x|×|\bby\b)\s*(\d+(?:\.\d+)?)", "", answer, count=1, flags=re.IGNORECASE
         ).strip(" ,;")
         draft["product_details"] = _merge_step1_blob(rest, swapped) if rest else swapped
-        if q := _extract_quantity(rest.lower()):
+        q = _extract_quantity(rest.lower()) if rest else None
+        if q:
             draft["_quantity_hint"] = q
+        note = f"Got it, updated to {new_size[0]:g} × {new_size[1]:g} in" + (f", {q:,} labels" if q else "") + ".\n\n"
         low = str(draft["product_details"]).lower()
         fp = _first_pending_step_index(draft)
-        if fp == 0:
-            return _step1_miss_result(draft, ", ".join(_step1_missing_parts(low)), conversation_history, conversation_id)
-        return EstimateFlowResult(
-            handled=True, reply=_prompt_for_pending_index(fp), assistant_meta=_meta_payload(draft, fp), estimate_id=None
+        followed = (
+            _step1_miss_result(draft, ", ".join(_step1_missing_parts(low)), conversation_history, conversation_id)
+            if fp == 0
+            else EstimateFlowResult(handled=True, reply=_prompt_for_pending_index(fp), assistant_meta=_meta_payload(draft, fp), estimate_id=None)
         )
+        return EstimateFlowResult(handled=followed.handled, reply=note + (followed.reply or ""), assistant_meta=followed.assistant_meta, estimate_id=None)
 
     if step_key == "product_details":
         if _looks_like_labeled_estimate_form(raw):
