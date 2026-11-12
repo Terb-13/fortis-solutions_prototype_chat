@@ -1055,7 +1055,20 @@ def handle_estimate_flow(
             count=1,
             flags=re.IGNORECASE,
         )
-        step_key = "product_details"
+        q = _extract_quantity(answer.lower())
+        if q:
+            draft["_quantity_hint"] = q
+        fp = _first_pending_step_index(draft)
+        if fp == 0:
+            return _step1_miss_result(
+                draft, ", ".join(_step1_missing_parts(str(draft["product_details"]).lower())), conversation_history, conversation_id
+            )
+        return EstimateFlowResult(
+            handled=True,
+            reply=_prompt_for_pending_index(fp),
+            assistant_meta=_meta_payload(draft, fp),
+            estimate_id=None,
+        )
 
     if step_key == "product_details":
         if _looks_like_labeled_estimate_form(raw):

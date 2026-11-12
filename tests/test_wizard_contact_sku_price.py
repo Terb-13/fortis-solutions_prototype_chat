@@ -162,6 +162,21 @@ class TestMidQuoteSizeChange(unittest.TestCase):
         self.assertNotEqual(saved["item"]["total"], 83.9)
 
     @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
+    def test_address_step_size_change_still_asks_for_address(self, _fetch):
+        draft = {
+            "product_details": "5000 2x3 white bopp gloss cmyk",
+            "_quantity_hint": 5000,
+            "business_name": "Acme",
+            "contact_name": "Sam Jones",
+            "email": "a@b.co",
+        }
+        result = _turn(4, draft, "actually 3x4")
+        self.assertIsNone(result.estimate_id)
+        self.assertIn("Step 5/5", result.reply)
+        self.assertNotIn("Your quote is ready", result.reply)
+        self.assertIn("3x4", result.assistant_meta["estimate_flow"]["draft"]["product_details"])
+
+    @patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None)
     def test_third_quantity_miss(self, _fetch):
         self.assertEqual(_quantity_misses(3).reply, "No problem. Whenever you have a number, send it here and I'll price it.")
 
