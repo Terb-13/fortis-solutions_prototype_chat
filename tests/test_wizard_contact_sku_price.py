@@ -4,7 +4,7 @@ import unittest
 from decimal import Decimal
 from unittest.mock import patch
 
-from fortis_cs_agent.estimate_flow import _persist_structured_estimate, handle_estimate_flow
+from fortis_cs_agent.estimate_flow import _PRICE_UNAVAILABLE, _persist_structured_estimate, handle_estimate_flow
 from fortis_cs_agent.knowledge import retrieve_pricing
 
 _CID = "00000000-0000-4000-8000-000000000581"
@@ -102,38 +102,28 @@ class TestCommaQuantityAndPricingFailure(unittest.TestCase):
         self.assertNotIn("Step 2/5", again.reply)
 
 
-def _skip_quote(product: str, hint: int, row: dict):
-    from fortis_cs_agent.estimate_flow import _PRICE_UNAVAILABLE
-
+def _skip_quote(product: str, hint: int, rows: list[dict]):
     draft = {"product_details": product, "_quantity_hint": hint, "business_name": "Acme", "contact_name": "Sam Jones", "email": "a@b.co"}
     history = [{"role": "assistant", "content": "**Step 5/5:** address", "meta": {"estimate_flow": {"active": True, "version": 1, "pending_step_index": 4, "draft": draft}}}]
     with (
         patch("fortis_cs_agent.estimate_flow.fetch_estimate_session", return_value=None),
-        patch("fortis_cs_agent.estimate_flow.retrieve_pricing", return_value=[row]),
+        patch("fortis_cs_agent.estimate_flow.retrieve_pricing", return_value=rows),
         patch("fortis_cs_agent.estimate_flow.execute_agent_tool") as tool,
     ):
         result = handle_estimate_flow(user_message="skip", conversation_history=history, conversation_id=_CID)
-    return result, tool, _PRICE_UNAVAILABLE
+    return result, tool
 
 
 class TestUnlistedSizeAndBelowTier(unittest.TestCase):
     def test_unlisted_7x11_is_not_quoted(self):
-        result, tool, unavailable = _skip_quote(
-            "5000 labels 7x11 white bopp gloss cmyk",
-            5000,
-            {"sku": "STICKER_3.125x11", "width_in": 3.125, "height_in": 11, "cost_5000": "3091.10"},
-        )
-        self.assertIn(unavailable, result.reply)
+        result, tool = _skip_quote("5000 labels 7x11 white bopp gloss cmyk", 5000, [])
+        self.assertIn(_PRICE_UNAVAILABLE, result.reply)
         self.assertIsNone(result.estimate_id)
         tool.assert_not_called()
 
     def test_quantity_below_smallest_tier_is_not_quoted(self):
-        result, tool, unavailable = _skip_quote(
-            "37 labels 2x3 white bopp gloss cmyk",
-            37,
-            {**_ROWS[1], "cost_100": "3091.10"},
-        )
-        self.assertIn(unavailable, result.reply)
+        result, tool = _skip_quote("37 labels 2x3 white bopp gloss cmyk", 37, [{**_ROWS[1], "cost_100": "3091.10"}])
+        self.assertIn(_PRICE_UNAVAILABLE, result.reply)
         self.assertIsNone(result.estimate_id)
         tool.assert_not_called()
 

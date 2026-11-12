@@ -28,12 +28,7 @@ from fortis_cs_agent.estimate_sessions import (
     update_estimate_session_status,
     upsert_estimate_session,
 )
-from fortis_cs_agent.knowledge import (
-    _extract_quantity,
-    _extract_size_tuple,
-    _row_matches_size_tolerance,
-    retrieve_pricing,
-)
+from fortis_cs_agent.knowledge import _extract_quantity, _extract_size_tuple, retrieve_pricing
 from fortis_cs_agent.tools import execute_agent_tool, quote_page_url
 
 logger = logging.getLogger(__name__)
@@ -547,7 +542,6 @@ def _invalid_business_name_reply(code: str, snippet: str) -> str:
 
     return (
         f"{body}"
-        "What business name should go on the quote? Reply Individual if it's personal.\n\n"
         "**Step 2/5 (again):** What business name should go on the quote? Reply Individual if it's personal."
     )
 
@@ -719,15 +713,12 @@ def _persist_structured_estimate(
         return (_PRICE_UNAVAILABLE, None)
 
     row = pricing_rows[0]
-    requested = _extract_size_tuple(str(blob).lower())
-    if requested is None or not (
-        _row_matches_size_tolerance(row, requested[0], requested[1], 0.02)
-        or _row_matches_size_tolerance(row, requested[1], requested[0], 0.02)
-    ):
+    if _extract_size_tuple(str(blob).lower()) is None:
         return (_PRICE_UNAVAILABLE, None)
     qty_hint = draft.get("_quantity_hint")
     qty = int(qty_hint) if isinstance(qty_hint, int) else _extract_quantity(str(blob).lower())
-    qty = qty or 1000
+    if not qty:
+        return (_PRICE_UNAVAILABLE, None)
     ck = _qty_to_cost_key(qty)
     raw_cost = row.get(ck) if ck else None
     if raw_cost is None:
